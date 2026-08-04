@@ -1,0 +1,22 @@
+{
+  "block.video_synchronizer.screen": "视频屏幕",
+  "block.video_synchronizer.video_manager": "视频管理器",
+  "itemGroup.video_synchronizer": "视频同步器",
+  "gui.video_synchronizer.manager.title": "视频管理器",
+  "gui.video_synchronizer.manager.screen_id": "目标屏幕 ID",
+  "gui.video_synchronizer.manager.url": "媒体链接",
+  "gui.video_synchronizer.manager.position": "进度（毫秒）",
+  "gui.video_synchronizer.manager.save": "保存目标",
+  "gui.video_synchronizer.manager.start": "开始播放",
+  "gui.video_synchronizer.manager.pause": "暂停",
+  "gui.video_synchronizer.manager.resume": "继续",
+  "gui.video_synchronizer.manager.seek": "跳转",
+  "gui.video_synchronizer.manager.stop": "停止",
+  "gui.video_synchronizer.manager.status_playing": "播放中 %s / %s",
+  "gui.video_synchronizer.manager.status_paused": "已暂停 %s / %s",
+  "gui.video_synchronizer.manager.status_idle": "该屏幕当前没有播放视频",
+  "overlay.video_synchronizer.progress_playing": "播放中",
+  "overlay.video_synchronizer.progress_paused": "已暂停",
+  "overlay.video_synchronizer.progress_syncing": "同步",
+  "message.video_synchronizer.playback_protected": "请先停止播放再破坏此方块"
+}

@@ -1,0 +1,12 @@
+{
+  "parent": "minecraft:block/cube",
+  "textures": {
+    "particle": "video_synchronizer:block/video_manager_front",
+    "down": "video_synchronizer:block/video_manager_bottom",
+    "up": "video_synchronizer:block/video_manager_top",
+    "north": "video_synchronizer:block/video_manager_front",
+    "south": "video_synchronizer:block/video_manager_front",
+    "west": "video_synchronizer:block/video_manager_side",
+    "east": "video_synchronizer:block/video_manager_side"
+  }
+}

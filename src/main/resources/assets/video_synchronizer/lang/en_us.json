@@ -1,0 +1,22 @@
+{
+  "block.video_synchronizer.screen": "Video Screen",
+  "block.video_synchronizer.video_manager": "Video Manager",
+  "itemGroup.video_synchronizer": "Video Synchronizer",
+  "gui.video_synchronizer.manager.title": "Video Manager",
+  "gui.video_synchronizer.manager.screen_id": "Target screen ID",
+  "gui.video_synchronizer.manager.url": "Media URL",
+  "gui.video_synchronizer.manager.position": "Position (milliseconds)",
+  "gui.video_synchronizer.manager.save": "Save Target",
+  "gui.video_synchronizer.manager.start": "Start Playback",
+  "gui.video_synchronizer.manager.pause": "Pause",
+  "gui.video_synchronizer.manager.resume": "Resume",
+  "gui.video_synchronizer.manager.seek": "Seek",
+  "gui.video_synchronizer.manager.stop": "Stop",
+  "gui.video_synchronizer.manager.status_playing": "Playing %s / %s",
+  "gui.video_synchronizer.manager.status_paused": "Paused %s / %s",
+  "gui.video_synchronizer.manager.status_idle": "No active video for this screen",
+  "overlay.video_synchronizer.progress_playing": "Playing",
+  "overlay.video_synchronizer.progress_paused": "Paused",
+  "overlay.video_synchronizer.progress_syncing": "Syncing",
+  "message.video_synchronizer.playback_protected": "Stop playback before breaking this block"
+}

@@ -1,0 +1,5 @@
+{
+  "variants": {
+    "": { "model": "video_synchronizer:block/video_manager" }
+  }
+}

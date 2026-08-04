@@ -1,0 +1,10 @@
+{
+  "multipart": [
+    { "when": { "facing": "north" }, "apply": { "model": "video_synchronizer:block/screen" } },
+    { "when": { "facing": "east" }, "apply": { "model": "video_synchronizer:block/screen_east" } },
+    { "when": { "facing": "south" }, "apply": { "model": "video_synchronizer:block/screen_south" } },
+    { "when": { "facing": "west" }, "apply": { "model": "video_synchronizer:block/screen_west" } },
+    { "when": { "facing": "up" }, "apply": { "model": "video_synchronizer:block/screen_up" } },
+    { "when": { "facing": "down" }, "apply": { "model": "video_synchronizer:block/screen_down" } }
+  ]
+}
