@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to build and publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,6 +43,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up Java 17
         uses: actions/setup-java@v5
@@ -49,11 +60,11 @@ jobs:
       - name: Build release JAR
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
           FFMPEG_PLATFORM: ${{ matrix.platform }}
           CLASSIFIER: ${{ matrix.classifier }}
         run: |
           set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]
           version="${RELEASE_TAG#v}"
           gradle build --no-daemon --stacktrace \
             -Pmod_version="$version" \
@@ -80,6 +91,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Download release JARs
         uses: actions/download-artifact@v8
@@ -102,11 +115,123 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          name: Video Synchronizer ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Video Synchronizer ${{ env.RELEASE_TAG }}
           body_path: .github/release-template.md
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           fail_on_unmatched_files: true
           files: |
             release-artifacts/*.jar
             release-artifacts/SHA256SUMS
+
+      - name: Check Modrinth publishing configuration
+        id: modrinth_config
+        shell: bash
+        env:
+          MODRINTH_PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+        run: |
+          if [[ -n "$MODRINTH_PROJECT_ID" && -n "$MODRINTH_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping Modrinth upload: configure the MODRINTH_PROJECT_ID repository variable and MODRINTH_TOKEN repository secret"
+          fi
+
+      - name: Publish release to Modrinth
+        if: steps.modrinth_config.outputs.enabled == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODRINTH_PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          case "$version" in
+            *-alpha*|*-snapshot*) version_type="alpha" ;;
+            *-beta*|*-rc*) version_type="beta" ;;
+            *) version_type="release" ;;
+          esac
+
+          existing_versions="$(curl --silent --show-error --fail-with-body \
+            -H "Authorization: ${MODRINTH_TOKEN}" \
+            -H "User-Agent: heartalborada-del/VideoSynchronizerForge (https://github.com/heartalborada-del/VideoSynchronizerForge)" \
+            "https://api.modrinth.com/v2/project/${MODRINTH_PROJECT_ID}/version" \
+            | jq -c 'map(.version_number)')"
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            --jq '.body // ""' > release-artifacts/GITHUB_CHANGELOG.md
+
+          classifiers=(linux-amd64 linux-arm64 windows-amd64 windows-arm64 no-ffmpeg)
+          display_names=("Linux AMD64" "Linux ARM64" "Windows AMD64" "Windows ARM64" "No embedded FFmpeg")
+          descriptions_en=(
+            'For Linux AMD64; includes an LGPL shared FFmpeg distribution.'
+            'For Linux ARM64; includes an LGPL shared FFmpeg distribution.'
+            'For Windows AMD64; includes an LGPL shared FFmpeg distribution.'
+            'For Windows ARM64; includes an LGPL shared FFmpeg distribution.'
+            'Platform-independent build without embedded FFmpeg; requires `ffmpeg` and `ffprobe` on `PATH`.'
+          )
+          descriptions_zh=(
+            '适用于 Linux AMD64；内嵌 LGPL shared FFmpeg。'
+            '适用于 Linux ARM64；内嵌 LGPL shared FFmpeg。'
+            '适用于 Windows AMD64；内嵌 LGPL shared FFmpeg。'
+            '适用于 Windows ARM64；内嵌 LGPL shared FFmpeg。'
+            '不内嵌 FFmpeg 的跨平台版本；需要在 `PATH` 中提供 `ffmpeg` 和 `ffprobe`。'
+          )
+
+          for index in "${!classifiers[@]}"; do
+            classifier="${classifiers[$index]}"
+            modrinth_version="${version}-${classifier}"
+            if jq -e --arg version "$modrinth_version" 'index($version) != null' \
+              <<< "$existing_versions" > /dev/null; then
+              echo "Modrinth version ${modrinth_version} already exists; skipping"
+              continue
+            fi
+
+            mapfile -t matches < <(find release-artifacts -maxdepth 1 -type f \
+              -name "*-${classifier}.jar")
+            test "${#matches[@]}" -eq 1
+
+            changelog="release-artifacts/modrinth-changelog-${classifier}.md"
+            {
+              printf '> %s\n\n' "${descriptions_en[$index]}"
+              printf '> %s\n\n' "${descriptions_zh[$index]}"
+              cat release-artifacts/GITHUB_CHANGELOG.md
+            } > "$changelog"
+
+            featured=false
+            if [[ "$classifier" == "no-ffmpeg" ]]; then
+              featured=true
+            fi
+
+            metadata="release-artifacts/modrinth-version-${classifier}.json"
+            jq -n \
+              --arg name "Video Synchronizer ${RELEASE_TAG} (${display_names[$index]})" \
+              --arg version_number "$modrinth_version" \
+              --rawfile changelog "$changelog" \
+              --arg version_type "$version_type" \
+              --arg project_id "$MODRINTH_PROJECT_ID" \
+              --argjson featured "$featured" \
+              '{
+                name: $name,
+                version_number: $version_number,
+                changelog: $changelog,
+                dependencies: [],
+                game_versions: ["1.20.1"],
+                version_type: $version_type,
+                loaders: ["forge"],
+                featured: $featured,
+                project_id: $project_id,
+                file_parts: ["file"],
+                primary_file: "file"
+              }' > "$metadata"
+
+            curl --fail-with-body --retry 3 --retry-all-errors \
+              -H "Authorization: ${MODRINTH_TOKEN}" \
+              -H "User-Agent: heartalborada-del/VideoSynchronizerForge (https://github.com/heartalborada-del/VideoSynchronizerForge)" \
+              -F "data=@${metadata};type=application/json" \
+              -F "file=@${matches[0]};type=application/java-archive" \
+              https://api.modrinth.com/v2/version
+          done

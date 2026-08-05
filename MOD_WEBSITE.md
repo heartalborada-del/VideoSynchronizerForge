@@ -30,13 +30,13 @@ work away from the server while preserving synchronized playback across all clie
 - Forge
 - Java 17
 
-Choose the JAR matching each client's operating system and architecture:
+Modrinth lists five separate versions. Choose the suffix matching the client:
 
-- Windows AMD64 or ARM64
-- Linux AMD64 or ARM64
-- `no-ffmpeg` for systems with `ffmpeg` and `ffprobe` already available on `PATH`
+- `linux-amd64` or `linux-arm64`
+- `windows-amd64` or `windows-arm64`
+- `no-ffmpeg` when `ffmpeg` and `ffprobe` are already available on `PATH`
 
-Platform-specific builds include an LGPL shared FFmpeg distribution. Video decoding is
+The platform builds include an LGPL shared FFmpeg distribution. Video decoding is
 client-side, so the dedicated server may use any release variant.
 
 ## Quick start
@@ -97,13 +97,13 @@ Video Synchronizer 由服务端维护统一的播放会话和权威时钟，各�
 - Forge
 - Java 17
 
-每个客户端请选择与自身系统和架构匹配的 JAR：
+Modrinth 会列出五个独立版本，请根据客户端选择对应后缀：
 
-- Windows AMD64 或 ARM64
-- Linux AMD64 或 ARM64
-- 已在 `PATH` 中安装 `ffmpeg` 和 `ffprobe` 的系统可使用 `no-ffmpeg`
+- `linux-amd64` 或 `linux-arm64`
+- `windows-amd64` 或 `windows-arm64`
+- 已在 `PATH` 中提供 `ffmpeg` 和 `ffprobe` 时选择 `no-ffmpeg`
 
-平台专用版本内嵌 LGPL shared FFmpeg。媒体解码只在客户端进行，因此独立服务端可以使用
+平台版本内嵌 LGPL shared FFmpeg。媒体解码只在客户端进行，因此独立服务端可以使用
 任意发布版本。
 
 ## 快速开始
