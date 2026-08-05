@@ -1,5 +1,8 @@
 {
   "variants": {
-    "": { "model": "video_synchronizer:block/video_manager" }
+    "facing=north": { "model": "video_synchronizer:block/video_manager" },
+    "facing=east": { "model": "video_synchronizer:block/video_manager", "y": 90 },
+    "facing=south": { "model": "video_synchronizer:block/video_manager", "y": 180 },
+    "facing=west": { "model": "video_synchronizer:block/video_manager", "y": 270 }
   }
 }

@@ -80,8 +80,8 @@ public final class ServerVideoEvents {
     @SubscribeEvent
     public static void onRegisterCommands(RegisterCommandsEvent event) {
         event.getDispatcher().register(Commands.literal("video")
-                .requires(source -> source.hasPermission(2))
                 .then(Commands.literal("start")
+                        .requires(source -> source.hasPermission(2))
                         .then(Commands.argument("video_id", StringArgumentType.word())
                                 .then(Commands.argument("url", StringArgumentType.string())
                                                 .executes(context -> {
@@ -99,6 +99,7 @@ public final class ServerVideoEvents {
                                                     }
                                                 }))))
                 .then(Commands.literal("create")
+                        .requires(source -> source.hasPermission(2))
                         .then(Commands.argument("screen_id", StringArgumentType.word())
                                 .then(Commands.argument("width", IntegerArgumentType.integer(
                                                 1, ScreenLayout.MAX_DIMENSION))
@@ -130,15 +131,18 @@ public final class ServerVideoEvents {
                                                         return 0;
                                                     }
                                                 })))))
-                .then(Commands.literal("pause").executes(context -> {
+                .then(Commands.literal("pause")
+                        .requires(source -> source.hasPermission(2)).executes(context -> {
                     ServerVideoSession.setPlaying(context.getSource().getServer(), false);
                     return 1;
                 }))
-                .then(Commands.literal("resume").executes(context -> {
+                .then(Commands.literal("resume")
+                        .requires(source -> source.hasPermission(2)).executes(context -> {
                     ServerVideoSession.setPlaying(context.getSource().getServer(), true);
                     return 1;
                 }))
                 .then(Commands.literal("seek")
+                        .requires(source -> source.hasPermission(2))
                         .then(Commands.argument("milliseconds", LongArgumentType.longArg(0L))
                                 .executes(context -> {
                                     ServerVideoSession.seek(context.getSource().getServer(),
@@ -146,6 +150,7 @@ public final class ServerVideoEvents {
                                     return 1;
                                 })))
                 .then(Commands.literal("weight")
+                        .requires(source -> source.hasPermission(2))
                         .then(Commands.argument("player", EntityArgument.player())
                                 .then(Commands.argument("value", DoubleArgumentType.doubleArg(0.01D, 100.0D))
                                         .executes(context -> {
@@ -158,6 +163,7 @@ public final class ServerVideoEvents {
                                             return 1;
                                         }))))
                 .then(Commands.literal("bind")
+                        .requires(source -> source.hasPermission(2))
                         .then(Commands.argument("screen_id", StringArgumentType.word())
                                 .executes(context -> {
                                     try {
@@ -171,19 +177,33 @@ public final class ServerVideoEvents {
                                         return 0;
                                     }
                                 })))
-                .then(Commands.literal("unbind").executes(context -> {
+                .then(Commands.literal("unbind")
+                        .requires(source -> source.hasPermission(2)).executes(context -> {
                     ServerVideoSession.unbindScreen(context.getSource().getServer());
                     context.getSource().sendSuccess(() -> Component.literal("Video screen binding cleared"), true);
                     return 1;
                 }))
-                .then(Commands.literal("stop").executes(context -> {
+                .then(Commands.literal("stop")
+                        .requires(source -> source.hasPermission(2)).executes(context -> {
                     ServerVideoSession.stop();
                     return 1;
                 }))
-                .then(Commands.literal("status").executes(context -> {
-                    context.getSource().sendSuccess(
-                            () -> Component.literal(ServerVideoSession.describe()), false);
-                    return 1;
-                })));
+                .then(Commands.literal("status")
+                        .executes(context -> {
+                            context.getSource().sendSuccess(() -> ServerVideoSession.describe(
+                                    context.getSource().getServer(),
+                                    context.getSource().getPlayer()), false);
+                            return 1;
+                        })
+                        .then(Commands.literal("bossbar")
+                                .requires(source -> source.getEntity() instanceof ServerPlayer)
+                                .executes(context -> {
+                                    ServerPlayer player = context.getSource().getPlayerOrException();
+                                    boolean enabled = ServerVideoSession.toggleStatusBossBar(player);
+                                    context.getSource().sendSuccess(() -> Component.translatable(enabled
+                                            ? "command.video_synchronizer.bossbar.enabled"
+                                            : "command.video_synchronizer.bossbar.disabled"), false);
+                                    return 1;
+                                }))));
     }
 }

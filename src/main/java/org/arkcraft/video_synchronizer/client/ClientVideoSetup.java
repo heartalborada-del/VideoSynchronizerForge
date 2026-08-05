@@ -18,6 +18,7 @@ public final class ClientVideoSetup {
     public static void onClientSetup(FMLClientSetupEvent event) {
         event.enqueueWork(() -> {
             BlockEntityRenderers.register(Main.SCREEN_BLOCK_ENTITY.get(), ScreenBlockEntityRenderer::new);
+            FfmpegPlaybackAdapter.prepareExecutables();
             ClientVideoState.setPlaybackAdapter(FfmpegPlaybackAdapter.INSTANCE);
         });
     }

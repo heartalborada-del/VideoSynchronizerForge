@@ -1,14 +1,25 @@
 package org.arkcraft.video_synchronizer.server;
 
+import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerBossEvent;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.world.BossEvent;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraftforge.network.PacketDistributor;
+import org.arkcraft.video_synchronizer.Main;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
+import org.arkcraft.video_synchronizer.network.HttpStatusDescriptions;
+import org.arkcraft.video_synchronizer.network.MediaRequestOptions;
+import org.arkcraft.video_synchronizer.network.VideoHttpErrorMessage;
+import org.arkcraft.video_synchronizer.network.VideoLocalPauseMessage;
 import org.arkcraft.video_synchronizer.network.VideoProgressMessage;
+import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.VideoReadyMessage;
 import org.arkcraft.video_synchronizer.network.VideoStartMessage;
 import org.arkcraft.video_synchronizer.network.VideoStateMessage;
 import org.arkcraft.video_synchronizer.network.VideoStopMessage;
@@ -26,27 +37,40 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Server-authoritative video clock. All methods are called from the server thread.
  */
 public final class ServerVideoSession {
-    public static final int BROADCAST_INTERVAL_TICKS = 10;
     public static final int REPORT_TIMEOUT_TICKS = 100;
+    private static final long BROADCAST_DEBOUNCE_NANOS = TimeUnit.SECONDS.toNanos(1L);
+    private static final int READY_THRESHOLD_NUMERATOR = 4;
+    private static final int READY_THRESHOLD_DENOMINATOR = 5;
     private static final double MIN_WEIGHT = 0.01D;
     private static final double MAX_WEIGHT = 100.0D;
     /** A client cannot move more than this in one report, even if it claims to be playing. */
     private static final long MAX_REPORT_JUMP_MS = 120_000L;
     private static final long MAX_AUTHORITATIVE_DEVIATION_MS = 15_000L;
     private static final long MIN_OUTLIER_TOLERANCE_MS = 10_000L;
+    private static final long JOIN_REPORT_TOLERANCE_MS = 750L;
+    private static final int JOIN_REPORT_CONFIRMATIONS = 2;
     private static final long MAX_VIDEO_DURATION_MS = 24L * 60L * 60L * 1000L;
 
+    // Each player's newest sample replaces the previous one; the periodic recompute
+    // below therefore coalesces bursts before they can affect the authoritative clock.
     private static final Map<UUID, PlayerReport> REPORTS = new HashMap<>();
+    private static final Map<UUID, Integer> JOIN_REPORT_CONFIRMATIONS_BY_PLAYER =
+            new HashMap<>();
+    private static final Map<UUID, Long> READY_DURATIONS = new HashMap<>();
     private static final Map<UUID, Double> PLAYER_WEIGHTS = new HashMap<>();
+    private static final Map<UUID, ServerBossEvent> STATUS_BOSS_BARS = new HashMap<>();
     private static Session current;
     private static long serverTick;
+    private static long lastBroadcastNanos;
     private static long rejectedReports;
     private static String targetDimension;
     private static BlockPos targetAnchor;
@@ -62,13 +86,20 @@ public final class ServerVideoSession {
     public static void start(MinecraftServer server, String videoId, String url) {
         validateVideoId(videoId);
         validateMediaUrl(url);
-        startValidated(server, videoId, url);
+        startValidated(server, videoId, url, "", MediaRequestOptions.EMPTY, false, 0,
+                VideoPixelFormat.RGB24);
     }
 
-    public static void startForScreen(MinecraftServer server, String requestedScreenId, String url) {
+    public static void startForScreen(MinecraftServer server, String requestedScreenId,
+                                      String videoUrl, String audioUrl, String requestHeaders,
+                                      String cookie, boolean disableScaling,
+                                      int videoPipeLanes, VideoPixelFormat videoPixelFormat) {
         String screenId = ServerScreenRegistry.normalizeId(requestedScreenId);
         validateVideoId(screenId);
-        validateMediaUrl(url);
+        validateMediaUrl(videoUrl);
+        if (!audioUrl.isBlank()) {
+            validateMediaUrl(audioUrl);
+        }
         ServerScreenRegistry.ScreenReference reference = ServerScreenRegistry.require(server, screenId);
         ServerLevel level = server.getLevel(reference.dimension());
         if (level == null) {
@@ -76,13 +107,25 @@ public final class ServerVideoSession {
         }
         invalidateScreenLayout(level, reference.pos());
         setTarget(level, reference.pos(), screenId);
-        startValidated(server, screenId, url);
+        startValidated(server, screenId, videoUrl, audioUrl,
+                new MediaRequestOptions(requestHeaders, cookie), disableScaling,
+                normalizeVideoPipeLanes(videoPipeLanes), videoPixelFormat);
     }
 
-    private static void startValidated(MinecraftServer server, String videoId, String url) {
-        current = new Session(UUID.randomUUID().toString(), videoId, url, 0L,
-                0L, true, 1L, System.nanoTime());
+    private static void startValidated(MinecraftServer server, String videoId,
+                                       String videoUrl, String audioUrl,
+                                       MediaRequestOptions requestOptions,
+                                       boolean disableScaling, int videoPipeLanes,
+                                       VideoPixelFormat videoPixelFormat) {
+        boolean waitingForClients = server.getPlayerList().getPlayerCount() > 0;
+        current = new Session(UUID.randomUUID().toString(), videoId, videoUrl, audioUrl,
+                requestOptions, disableScaling, videoPipeLanes, 0L, 0L,
+                videoPixelFormat == null ? VideoPixelFormat.RGB24 : videoPixelFormat,
+                !waitingForClients,
+                waitingForClients, true, 1L, System.nanoTime());
         REPORTS.clear();
+        JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.clear();
+        READY_DURATIONS.clear();
         rejectedReports = 0L;
         broadcastStart(server);
     }
@@ -155,11 +198,36 @@ public final class ServerVideoSession {
         String stoppedSession = current.sessionId;
         current = null;
         REPORTS.clear();
+        JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.clear();
+        READY_DURATIONS.clear();
         VideoNetwork.CHANNEL.send(PacketDistributor.ALL.noArg(), new VideoStopMessage(stoppedSession));
+    }
+
+    public static void acceptHttpError(MinecraftServer server, ServerPlayer player,
+                                       VideoHttpErrorMessage message) {
+        if (current == null || !current.sessionId.equals(message.sessionId())
+                || message.statusCode() < 100 || message.statusCode() > 999
+                || message.statusCode() == 200 || message.statusCode() == 206) {
+            return;
+        }
+        int statusCode = message.statusCode();
+        String description = HttpStatusDescriptions.describe(statusCode);
+        Main.LOGGER.warn("Stopping video session after HTTP failure reported by {}: status={} {}",
+                player.getGameProfile().getName(), statusCode, description);
+        stop();
+        server.getPlayerList().broadcastSystemMessage(Component.translatable(
+                "message.video_synchronizer.http_error", statusCode, description)
+                .withStyle(ChatFormatting.RED), false);
     }
 
     public static void setPlaying(MinecraftServer server, boolean playing) {
         if (current == null) {
+            return;
+        }
+        if (current.waitingForClients) {
+            current.playWhenReady = playing;
+            current.revision++;
+            broadcastState(server, false);
             return;
         }
         long nowNanos = System.nanoTime();
@@ -170,6 +238,7 @@ public final class ServerVideoSession {
         // Playback intent is command-authoritative. Reports captured before this
         // command must not immediately overwrite the new pause/resume state.
         REPORTS.clear();
+        JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.replaceAll((playerId, confirmations) -> 0);
         broadcastState(server, false);
     }
 
@@ -177,10 +246,18 @@ public final class ServerVideoSession {
         if (current == null) {
             return;
         }
+        boolean playWhenReady = current.waitingForClients
+                ? current.playWhenReady : current.playing;
+        boolean waitingForClients = server.getPlayerList().getPlayerCount() > 0;
         current.positionMs = clampToDuration(positionMs);
         current.positionNanos = System.nanoTime();
+        current.playWhenReady = playWhenReady;
+        current.waitingForClients = waitingForClients;
+        current.playing = waitingForClients ? false : playWhenReady;
         current.revision++;
         REPORTS.clear();
+        JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.clear();
+        READY_DURATIONS.clear();
         broadcastState(server, true);
     }
 
@@ -203,10 +280,15 @@ public final class ServerVideoSession {
         boolean active = current != null && screenId != null && !screenId.isBlank()
                 && screenId.equals(targetScreenId);
         if (!active) {
-            return new ControlState(false, "", 0L, 0L, false);
+            return new ControlState(false, "", "", "", "", false, 0,
+                    VideoPixelFormat.RGB24,
+                    0L, 0L, false, false);
         }
-        return new ControlState(true, current.url, positionAt(current, System.nanoTime()),
-                current.durationMs, current.playing);
+        return new ControlState(true, current.videoUrl, current.audioUrl,
+                current.requestOptions.headers(), current.requestOptions.cookie(),
+                current.disableScaling, current.videoPipeLanes, current.videoPixelFormat,
+                positionAt(current, System.nanoTime()), current.durationMs,
+                current.playing, current.waitingForClients);
     }
 
     public static boolean isPlaybackProtected(ServerLevel level, BlockPos pos) {
@@ -258,6 +340,9 @@ public final class ServerVideoSession {
             sendCurrent(player);
             return;
         }
+        if (current.waitingForClients) {
+            return;
+        }
         long reportedDuration = message.durationMs();
         if (reportedDuration < 0L || (reportedDuration > 0L
                 && (reportedDuration < 1_000L || reportedDuration > MAX_VIDEO_DURATION_MS))) {
@@ -279,7 +364,24 @@ public final class ServerVideoSession {
             rejectedReports++;
             return;
         }
-        PlayerReport previous = REPORTS.get(player.getUUID());
+        UUID playerId = player.getUUID();
+        Integer confirmations = JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.get(playerId);
+        if (confirmations != null) {
+            boolean closeToClock = Math.abs(position - expectedPosition)
+                    <= JOIN_REPORT_TOLERANCE_MS;
+            boolean matchingPlaybackState = message.playing() == current.playing;
+            if (!closeToClock || !matchingPlaybackState) {
+                JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.put(playerId, 0);
+                return;
+            }
+            int updatedConfirmations = confirmations + 1;
+            if (updatedConfirmations < JOIN_REPORT_CONFIRMATIONS) {
+                JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.put(playerId, updatedConfirmations);
+                return;
+            }
+            JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.remove(playerId);
+        }
+        PlayerReport previous = REPORTS.get(playerId);
         if (previous != null) {
             long elapsedMs = Math.max(50L, elapsedMillis(previous.receivedNanos, nowNanos));
             long jump = Math.abs(position - previous.positionMs);
@@ -291,13 +393,72 @@ public final class ServerVideoSession {
                 return;
             }
         }
-        REPORTS.put(player.getUUID(), new PlayerReport(
-                position, reportedDuration, weight, serverTick, nowNanos));
+        REPORTS.put(playerId, new PlayerReport(
+                position, reportedDuration, message.playing(), weight, serverTick, nowNanos));
+    }
+
+    public static void acceptReady(MinecraftServer server, ServerPlayer player,
+                                   VideoReadyMessage message) {
+        if (current == null || !current.sessionId.equals(message.sessionId())) {
+            sendCurrent(player);
+            return;
+        }
+        if (!current.waitingForClients) {
+            return;
+        }
+        long duration = message.durationMs();
+        if (duration < 0L || (duration > 0L
+                && (duration < 1_000L || duration > MAX_VIDEO_DURATION_MS))) {
+            rejectedReports++;
+            return;
+        }
+        READY_DURATIONS.put(player.getUUID(), duration);
+        tryBeginPlayback(server);
+    }
+
+    public static void acceptLocalPause(ServerPlayer player, VideoLocalPauseMessage message) {
+        MinecraftServer server = player.getServer();
+        if (server == null || current == null
+                || !current.sessionId.equals(message.sessionId())
+                || server.isDedicatedServer() || server.isPublished()
+                || server.getPlayerList().getPlayerCount() != 1
+                || !server.isSingleplayerOwner(player.getGameProfile())) {
+            return;
+        }
+        if (message.sequence() <= current.lastLocalPauseSequence
+                || message.durationMs() < 0L
+                || message.durationMs() > MAX_VIDEO_DURATION_MS) {
+            return;
+        }
+        current.lastLocalPauseSequence = message.sequence();
+        if (!current.playing || message.durationMs() == 0L) {
+            return;
+        }
+        current.positionNanos += TimeUnit.MILLISECONDS.toNanos(message.durationMs());
+        current.revision++;
+        REPORTS.clear();
+        JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.replaceAll((playerId, confirmations) -> 0);
+        broadcastState(server, false);
     }
 
     public static void tick(MinecraftServer server) {
         serverTick++;
+        if (serverTick % 5L == 0L) {
+            updateStatusBossBars(server);
+        }
         if (current == null) {
+            return;
+        }
+
+        if (current.waitingForClients) {
+            READY_DURATIONS.keySet().removeIf(
+                    playerId -> server.getPlayerList().getPlayer(playerId) == null);
+            if (tryBeginPlayback(server)) {
+                return;
+            }
+            if (periodicBroadcastReady()) {
+                broadcastState(server, false);
+            }
             return;
         }
 
@@ -311,14 +472,25 @@ public final class ServerVideoSession {
             }
         }
 
-        if (serverTick % BROADCAST_INTERVAL_TICKS == 0) {
+        if (periodicBroadcastReady()) {
             recomputeAuthoritativeState();
+            if (playbackReachedEnd()) {
+                Main.LOGGER.info("Video session reached the end and will stop automatically");
+                stop();
+                return;
+            }
             broadcastState(server, false);
         }
     }
 
     public static void playerDisconnected(UUID playerId) {
         REPORTS.remove(playerId);
+        JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.remove(playerId);
+        READY_DURATIONS.remove(playerId);
+        ServerBossEvent bossBar = STATUS_BOSS_BARS.remove(playerId);
+        if (bossBar != null) {
+            bossBar.removeAllPlayers();
+        }
     }
 
     public static void setPlayerWeight(UUID playerId, double weight) {
@@ -329,7 +501,8 @@ public final class ServerVideoSession {
         PlayerReport report = REPORTS.get(playerId);
         if (report != null) {
             REPORTS.put(playerId, new PlayerReport(report.positionMs, report.durationMs,
-                    PLAYER_WEIGHTS.get(playerId), report.receivedTick, report.receivedNanos));
+                    report.playing, PLAYER_WEIGHTS.get(playerId), report.receivedTick,
+                    report.receivedNanos));
         }
     }
 
@@ -337,18 +510,35 @@ public final class ServerVideoSession {
         if (current == null) {
             return;
         }
-        long position = positionAt(current, System.nanoTime());
+        UUID playerId = player.getUUID();
+        REPORTS.remove(playerId);
+        if (current.waitingForClients) {
+            JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.remove(playerId);
+        } else {
+            JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.put(playerId, 0);
+        }
+        long nowNanos = System.nanoTime();
+        long position = positionAt(current, nowNanos);
         VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
-                new VideoStartMessage(current.sessionId, current.videoId, current.url, current.durationMs,
-                        position, current.playing, current.revision));
+                new VideoStartMessage(current.sessionId, current.videoId, current.videoUrl,
+                        current.audioUrl, current.requestOptions.headers(),
+                        current.requestOptions.cookie(), current.disableScaling,
+                        current.videoPipeLanes, current.videoPixelFormat,
+                        current.durationMs, position, current.playing,
+                        current.waitingForClients, current.revision, nowNanos));
         sendTarget(player);
     }
 
     public static void reset() {
         current = null;
         REPORTS.clear();
+        JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.clear();
+        READY_DURATIONS.clear();
         PLAYER_WEIGHTS.clear();
+        STATUS_BOSS_BARS.values().forEach(ServerBossEvent::removeAllPlayers);
+        STATUS_BOSS_BARS.clear();
         serverTick = 0L;
+        lastBroadcastNanos = 0L;
         rejectedReports = 0L;
         targetDimension = null;
         targetAnchor = null;
@@ -359,15 +549,199 @@ public final class ServerVideoSession {
         targetScreenUp = null;
     }
 
-    public static String describe() {
-        if (current == null) {
-            return "no active video";
+    public static boolean toggleStatusBossBar(ServerPlayer player) {
+        ServerBossEvent existing = STATUS_BOSS_BARS.remove(player.getUUID());
+        if (existing != null) {
+            existing.removeAllPlayers();
+            return false;
         }
-        String binding = targetAnchor == null ? "unbound" : "screen " + targetScreenId + " at "
-                + targetDimension + " " + targetAnchor.toShortString();
-        return current.videoId + " at " + positionAt(current, System.nanoTime()) + "ms, "
-                + (current.playing ? "playing" : "paused") + ", " + binding + ", "
-                + REPORTS.size() + " reports, " + rejectedReports + " rejected";
+        ServerBossEvent bossBar = new ServerBossEvent(
+                Component.translatable("command.video_synchronizer.bossbar.idle"),
+                BossEvent.BossBarColor.WHITE, BossEvent.BossBarOverlay.PROGRESS);
+        bossBar.setDarkenScreen(false);
+        bossBar.setPlayBossMusic(false);
+        bossBar.setCreateWorldFog(false);
+        bossBar.addPlayer(player);
+        STATUS_BOSS_BARS.put(player.getUUID(), bossBar);
+        updateStatusBossBar(player, bossBar, System.nanoTime());
+        return true;
+    }
+
+    public static Component describe(MinecraftServer server, ServerPlayer viewer) {
+        Component result = Component.translatable("command.video_synchronizer.status.header")
+                .withStyle(ChatFormatting.AQUA, ChatFormatting.BOLD);
+        if (current == null) {
+            return result.copy().append("\n").append(Component.translatable(
+                    "command.video_synchronizer.status.none").withStyle(ChatFormatting.GRAY));
+        }
+
+        long nowNanos = System.nanoTime();
+        long serverPosition = positionAt(current, nowNanos);
+        Component state = playbackStateComponent(current.playing, current.waitingForClients);
+        result = result.copy().append("\n").append(Component.translatable(
+                "command.video_synchronizer.status.session", current.videoId,
+                current.sessionId, state));
+        result = result.copy().append("\n").append(Component.translatable(
+                "command.video_synchronizer.status.time", formatTime(serverPosition),
+                formatTime(current.durationMs)));
+        result = result.copy().append("\n").append(Component.translatable(
+                "command.video_synchronizer.status.target", targetDescription()));
+        result = result.copy().append("\n").append(Component.translatable(
+                "command.video_synchronizer.status.clients", REPORTS.size(),
+                server.getPlayerList().getPlayerCount(), rejectedReports));
+
+        if (current.waitingForClients) {
+            int required = requiredReadyCount(server.getPlayerList().getPlayerCount());
+            Component localReadiness;
+            if (viewer == null) {
+                localReadiness = Component.translatable(
+                        "command.video_synchronizer.status.not_applicable");
+            } else {
+                localReadiness = Component.translatable(
+                        READY_DURATIONS.containsKey(viewer.getUUID())
+                                ? "command.video_synchronizer.status.ready"
+                                : "command.video_synchronizer.status.not_ready");
+            }
+            return result.copy().append("\n").append(Component.translatable(
+                    "command.video_synchronizer.status.readiness", READY_DURATIONS.size(),
+                    required, localReadiness));
+        }
+        if (viewer == null) {
+            return result;
+        }
+        PlayerReport report = REPORTS.get(viewer.getUUID());
+        if (report == null) {
+            return result.copy().append("\n").append(Component.translatable(
+                    "command.video_synchronizer.status.local_missing")
+                    .withStyle(ChatFormatting.RED));
+        }
+        long localPosition = projectedReportPosition(report, nowNanos);
+        long drift = localPosition - serverPosition;
+        long reportAgeMs = elapsedMillis(report.receivedNanos, nowNanos);
+        return result.copy().append("\n").append(Component.translatable(
+                "command.video_synchronizer.status.local", formatTime(localPosition),
+                signedMillis(drift), reportAgeMs,
+                playbackStateComponent(report.playing, false)));
+    }
+
+    private static void updateStatusBossBars(MinecraftServer server) {
+        if (STATUS_BOSS_BARS.isEmpty()) {
+            return;
+        }
+        long nowNanos = System.nanoTime();
+        Iterator<Map.Entry<UUID, ServerBossEvent>> iterator =
+                STATUS_BOSS_BARS.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<UUID, ServerBossEvent> entry = iterator.next();
+            ServerPlayer player = server.getPlayerList().getPlayer(entry.getKey());
+            if (player == null) {
+                entry.getValue().removeAllPlayers();
+                iterator.remove();
+                continue;
+            }
+            updateStatusBossBar(player, entry.getValue(), nowNanos);
+        }
+    }
+
+    private static void updateStatusBossBar(ServerPlayer player, ServerBossEvent bossBar,
+                                            long nowNanos) {
+        if (current == null) {
+            bossBar.setName(Component.translatable("command.video_synchronizer.bossbar.idle"));
+            bossBar.setColor(BossEvent.BossBarColor.WHITE);
+            bossBar.setProgress(0.0F);
+            return;
+        }
+        if (current.waitingForClients) {
+            int onlinePlayers = player.getServer().getPlayerList().getPlayerCount();
+            int required = requiredReadyCount(onlinePlayers);
+            boolean localReady = READY_DURATIONS.containsKey(player.getUUID());
+            bossBar.setName(Component.translatable(
+                    "command.video_synchronizer.bossbar.waiting", READY_DURATIONS.size(),
+                    required, Component.translatable(localReady
+                            ? "command.video_synchronizer.status.ready"
+                            : "command.video_synchronizer.status.not_ready")));
+            bossBar.setColor(BossEvent.BossBarColor.PURPLE);
+            bossBar.setProgress(required == 0 ? 1.0F
+                    : Math.min(1.0F, READY_DURATIONS.size() / (float) required));
+            return;
+        }
+        PlayerReport report = REPORTS.get(player.getUUID());
+        long serverPosition = positionAt(current, nowNanos);
+        if (report == null) {
+            bossBar.setName(Component.translatable(
+                    "command.video_synchronizer.bossbar.no_report",
+                    formatTime(serverPosition), formatTime(current.durationMs)));
+            bossBar.setColor(BossEvent.BossBarColor.RED);
+            bossBar.setProgress(progress(serverPosition, current.durationMs));
+            return;
+        }
+        long localPosition = projectedReportPosition(report, nowNanos);
+        long drift = localPosition - serverPosition;
+        long reportAgeMs = elapsedMillis(report.receivedNanos, nowNanos);
+        bossBar.setName(Component.translatable(
+                "command.video_synchronizer.bossbar.playback", formatTime(localPosition),
+                formatTime(report.durationMs > 0L ? report.durationMs : current.durationMs),
+                signedMillis(drift), playbackStateComponent(report.playing, false), reportAgeMs));
+        bossBar.setProgress(progress(localPosition,
+                report.durationMs > 0L ? report.durationMs : current.durationMs));
+        long absoluteDrift = Math.abs(drift);
+        if (reportAgeMs > 2_000L || absoluteDrift > 750L) {
+            bossBar.setColor(BossEvent.BossBarColor.RED);
+        } else if (absoluteDrift > 250L) {
+            bossBar.setColor(BossEvent.BossBarColor.YELLOW);
+        } else if (!report.playing) {
+            bossBar.setColor(BossEvent.BossBarColor.BLUE);
+        } else {
+            bossBar.setColor(BossEvent.BossBarColor.GREEN);
+        }
+    }
+
+    private static Component playbackStateComponent(boolean playing, boolean waiting) {
+        if (waiting) {
+            return Component.translatable("command.video_synchronizer.status.buffering")
+                    .withStyle(ChatFormatting.YELLOW);
+        }
+        return Component.translatable(playing
+                ? "command.video_synchronizer.status.playing"
+                : "command.video_synchronizer.status.paused")
+                .withStyle(playing ? ChatFormatting.GREEN : ChatFormatting.AQUA);
+    }
+
+    private static Component targetDescription() {
+        if (targetOrigin == null || targetDimension == null || targetLayout == null) {
+            return Component.translatable("command.video_synchronizer.status.unbound");
+        }
+        return Component.translatable("command.video_synchronizer.status.target_bound",
+                targetScreenId == null ? "-" : targetScreenId, targetDimension,
+                targetOrigin.toShortString(), targetLayout.width(), targetLayout.height());
+    }
+
+    private static long projectedReportPosition(PlayerReport report, long nowNanos) {
+        long projected = report.playing
+                ? report.positionMs + elapsedMillis(report.receivedNanos, nowNanos)
+                : report.positionMs;
+        return clampToDuration(projected);
+    }
+
+    private static float progress(long positionMs, long durationMs) {
+        if (durationMs <= 0L) {
+            return 0.0F;
+        }
+        return (float) clamp(positionMs / (double) durationMs, 0.0D, 1.0D);
+    }
+
+    private static String formatTime(long milliseconds) {
+        if (milliseconds <= 0L) {
+            return "00:00:00";
+        }
+        long totalSeconds = milliseconds / 1_000L;
+        return String.format(Locale.ROOT, "%02d:%02d:%02d",
+                totalSeconds / 3_600L, totalSeconds % 3_600L / 60L,
+                totalSeconds % 60L);
+    }
+
+    private static String signedMillis(long milliseconds) {
+        return String.format(Locale.ROOT, "%+d", milliseconds);
     }
 
     private static void recomputeAuthoritativeState() {
@@ -411,7 +785,10 @@ public final class ServerVideoSession {
             current.revision++;
             return;
         }
-        current.positionMs = clampToDuration(Math.round(weightedPosition / totalWeight));
+        long consensusPosition = clampToDuration(Math.round(weightedPosition / totalWeight));
+        long clockPosition = positionAt(current, nowNanos);
+        current.positionMs = current.playing
+                ? Math.max(clockPosition, consensusPosition) : consensusPosition;
         current.positionNanos = nowNanos;
         if (current.durationMs > 0L && current.positionMs >= current.durationMs) {
             current.playing = false;
@@ -419,11 +796,22 @@ public final class ServerVideoSession {
         current.revision++;
     }
 
+    private static boolean playbackReachedEnd() {
+        return current != null && !current.waitingForClients
+                && current.durationMs > 0L && current.positionMs >= current.durationMs;
+    }
+
     private static void broadcastStart(MinecraftServer server) {
-        long position = positionAt(current, System.nanoTime());
+        long nowNanos = System.nanoTime();
+        long position = positionAt(current, nowNanos);
+        lastBroadcastNanos = nowNanos;
         VideoNetwork.CHANNEL.send(PacketDistributor.ALL.noArg(),
-                new VideoStartMessage(current.sessionId, current.videoId, current.url, current.durationMs,
-                        position, current.playing, current.revision));
+                new VideoStartMessage(current.sessionId, current.videoId, current.videoUrl,
+                        current.audioUrl, current.requestOptions.headers(),
+                        current.requestOptions.cookie(), current.disableScaling,
+                        current.videoPipeLanes, current.videoPixelFormat,
+                        current.durationMs, position, current.playing,
+                        current.waitingForClients, current.revision, nowNanos));
         broadcastTarget(server);
     }
 
@@ -447,10 +835,68 @@ public final class ServerVideoSession {
     }
 
     private static void broadcastState(MinecraftServer server, boolean hardSeek) {
-        long position = positionAt(current, System.nanoTime());
+        long nowNanos = System.nanoTime();
+        long position = positionAt(current, nowNanos);
+        lastBroadcastNanos = nowNanos;
         VideoNetwork.CHANNEL.send(PacketDistributor.ALL.noArg(),
                 new VideoStateMessage(current.sessionId, position, current.durationMs,
-                        current.playing, hardSeek, current.revision));
+                        current.playing, current.waitingForClients, hardSeek, current.revision,
+                        nowNanos));
+    }
+
+    private static boolean periodicBroadcastReady() {
+        long nowNanos = System.nanoTime();
+        return lastBroadcastNanos == 0L
+                || nowNanos - lastBroadcastNanos >= BROADCAST_DEBOUNCE_NANOS;
+    }
+
+    private static boolean tryBeginPlayback(MinecraftServer server) {
+        if (current == null || !current.waitingForClients) {
+            return false;
+        }
+        int onlinePlayers = server.getPlayerList().getPlayerCount();
+        int requiredPlayers = requiredReadyCount(onlinePlayers);
+        if (READY_DURATIONS.size() < requiredPlayers) {
+            return false;
+        }
+        long reportedDuration = medianReadyDuration();
+        if (reportedDuration > 0L) {
+            current.durationMs = reportedDuration;
+        }
+        current.waitingForClients = false;
+        current.playing = current.playWhenReady;
+        current.positionNanos = System.nanoTime();
+        current.revision++;
+        REPORTS.clear();
+        JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.clear();
+        broadcastState(server, false);
+        return true;
+    }
+
+    private static int requiredReadyCount(int onlinePlayers) {
+        // Round up so small player counts never start below the requested 80%.
+        return (onlinePlayers * READY_THRESHOLD_NUMERATOR
+                + READY_THRESHOLD_DENOMINATOR - 1) / READY_THRESHOLD_DENOMINATOR;
+    }
+
+    private static long medianReadyDuration() {
+        List<Long> durations = new ArrayList<>(READY_DURATIONS.size());
+        for (long duration : READY_DURATIONS.values()) {
+            if (duration > 0L) {
+                durations.add(duration);
+            }
+        }
+        if (durations.isEmpty()) {
+            return 0L;
+        }
+        durations.sort(Comparator.naturalOrder());
+        int middle = durations.size() / 2;
+        if (durations.size() % 2 == 1) {
+            return durations.get(middle);
+        }
+        long lower = durations.get(middle - 1);
+        long upper = durations.get(middle);
+        return lower + (upper - lower) / 2L;
     }
 
     private static long medianPosition(long nowNanos) {
@@ -509,6 +955,13 @@ public final class ServerVideoSession {
         }
     }
 
+    private static int normalizeVideoPipeLanes(int lanes) {
+        return switch (lanes) {
+            case 1, 2, 4, 8, 16 -> lanes;
+            default -> 0;
+        };
+    }
+
     public static void validateMediaUrl(String url) {
         if (url == null) {
             throw new IllegalArgumentException("Invalid media URL");
@@ -542,42 +995,68 @@ public final class ServerVideoSession {
     private static final class PlayerReport {
         private final long positionMs;
         private final long durationMs;
+        private final boolean playing;
         private final double weight;
         private final long receivedTick;
         private final long receivedNanos;
 
-        private PlayerReport(long positionMs, long durationMs,
+        private PlayerReport(long positionMs, long durationMs, boolean playing,
                              double weight, long receivedTick, long receivedNanos) {
             this.positionMs = positionMs;
             this.durationMs = durationMs;
+            this.playing = playing;
             this.weight = weight;
             this.receivedTick = receivedTick;
             this.receivedNanos = receivedNanos;
         }
     }
 
-    public record ControlState(boolean active, String url, long positionMs,
-                               long durationMs, boolean playing) {
+    public record ControlState(boolean active, String videoUrl, String audioUrl,
+                               String requestHeaders, String cookie, boolean disableScaling,
+                               int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                               long positionMs,
+                               long durationMs, boolean playing,
+                               boolean waitingForClients) {
     }
 
     private static final class Session {
         private final String sessionId;
         private final String videoId;
-        private final String url;
+        private final String videoUrl;
+        private final String audioUrl;
+        private final MediaRequestOptions requestOptions;
+        private final boolean disableScaling;
+        private final int videoPipeLanes;
+        private final VideoPixelFormat videoPixelFormat;
         private long durationMs;
         private long positionMs;
         private boolean playing;
+        private boolean waitingForClients;
+        private boolean playWhenReady;
         private long revision;
         private long positionNanos;
+        private long lastLocalPauseSequence = Long.MIN_VALUE;
 
-        private Session(String sessionId, String videoId, String url, long durationMs,
-                        long positionMs, boolean playing, long revision, long positionNanos) {
+        private Session(String sessionId, String videoId, String videoUrl, String audioUrl,
+                        MediaRequestOptions requestOptions, boolean disableScaling,
+                        int videoPipeLanes, long durationMs, long positionMs,
+                        VideoPixelFormat videoPixelFormat,
+                        boolean playing,
+                        boolean waitingForClients, boolean playWhenReady, long revision,
+                        long positionNanos) {
             this.sessionId = sessionId;
             this.videoId = videoId;
-            this.url = url;
+            this.videoUrl = videoUrl;
+            this.audioUrl = audioUrl;
+            this.requestOptions = requestOptions;
+            this.disableScaling = disableScaling;
+            this.videoPipeLanes = videoPipeLanes;
+            this.videoPixelFormat = videoPixelFormat;
             this.durationMs = durationMs;
             this.positionMs = positionMs;
             this.playing = playing;
+            this.waitingForClients = waitingForClients;
+            this.playWhenReady = playWhenReady;
             this.revision = revision;
             this.positionNanos = positionNanos;
         }

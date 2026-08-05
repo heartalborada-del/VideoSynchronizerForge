@@ -8,7 +8,7 @@ import org.arkcraft.video_synchronizer.Main;
 
 /** The single protocol used by both sides of a video session. */
 public final class VideoNetwork {
-    private static final String PROTOCOL = "6";
+    private static final String PROTOCOL = "16";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(Main.MODID, "sync"),
             () -> PROTOCOL,
@@ -35,6 +35,15 @@ public final class VideoNetwork {
         CHANNEL.messageBuilder(VideoProgressMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
                 .encoder(VideoProgressMessage::encode).decoder(VideoProgressMessage::decode)
                 .consumerMainThread(VideoProgressMessage::handle).add();
+        CHANNEL.messageBuilder(VideoReadyMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(VideoReadyMessage::encode).decoder(VideoReadyMessage::decode)
+                .consumerMainThread(VideoReadyMessage::handle).add();
+        CHANNEL.messageBuilder(VideoHttpErrorMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(VideoHttpErrorMessage::encode).decoder(VideoHttpErrorMessage::decode)
+                .consumerMainThread(VideoHttpErrorMessage::handle).add();
+        CHANNEL.messageBuilder(VideoLocalPauseMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(VideoLocalPauseMessage::encode).decoder(VideoLocalPauseMessage::decode)
+                .consumerMainThread(VideoLocalPauseMessage::handle).add();
         CHANNEL.messageBuilder(VideoResyncMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
                 .encoder(VideoResyncMessage::encode).decoder(VideoResyncMessage::decode)
                 .consumerMainThread(VideoResyncMessage::handle).add();
@@ -56,5 +65,11 @@ public final class VideoNetwork {
         CHANNEL.messageBuilder(VideoManagerActionMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
                 .encoder(VideoManagerActionMessage::encode).decoder(VideoManagerActionMessage::decode)
                 .consumerMainThread(VideoManagerActionMessage::handle).add();
+        CHANNEL.messageBuilder(VideoTimeSyncRequestMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(VideoTimeSyncRequestMessage::encode).decoder(VideoTimeSyncRequestMessage::decode)
+                .consumerMainThread(VideoTimeSyncRequestMessage::handle).add();
+        CHANNEL.messageBuilder(VideoTimeSyncResponseMessage.class, nextId++, NetworkDirection.PLAY_TO_CLIENT)
+                .encoder(VideoTimeSyncResponseMessage::encode).decoder(VideoTimeSyncResponseMessage::decode)
+                .consumerMainThread(VideoTimeSyncResponseMessage::handle).add();
     }
 }

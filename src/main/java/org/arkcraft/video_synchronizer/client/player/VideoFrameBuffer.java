@@ -1,5 +1,7 @@
 package org.arkcraft.video_synchronizer.client.player;
 
+import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
+
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -58,7 +60,7 @@ public final class VideoFrameBuffer {
         }
         releasedFrames.incrementAndGet();
         if (pool.size() < 1) {
-            pool.offer(frame.rgba());
+            pool.offer(frame.data());
         } else {
             discardedArrays.incrementAndGet();
         }
@@ -80,7 +82,8 @@ public final class VideoFrameBuffer {
                 discardedArrays.get(), clearedFrames.get(), pending.get() != null, pool.size());
     }
 
-    public record DecodedFrame(int width, int height, long positionMs, byte[] rgba) {
+    public record DecodedFrame(int width, int height, long positionMs,
+                               VideoPixelFormat pixelFormat, byte[] data) {
     }
 
     public record Stats(long allocatedArrays, long reusedArrays, long submittedFrames,

@@ -7,6 +7,7 @@ import net.minecraft.resources.ResourceLocation;
 import org.arkcraft.video_synchronizer.client.ClientVideoState;
 import org.arkcraft.video_synchronizer.client.player.VideoFrameBuffer;
 import org.arkcraft.video_synchronizer.Main;
+import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL21;
@@ -27,6 +28,7 @@ public final class ScreenTexture {
     private ResourceLocation location;
     private int width;
     private int height;
+    private VideoPixelFormat pixelFormat;
     private final int[] pixelBuffers = new int[PIXEL_BUFFER_COUNT];
     private int pixelBufferIndex;
     private int pixelBufferSize;
@@ -112,24 +114,28 @@ public final class ScreenTexture {
     private void upload(VideoFrameBuffer.DecodedFrame frame) {
         try {
             boolean createdTexture = false;
-            if (texture == null || width != frame.width() || height != frame.height()) {
+            if (texture == null || width != frame.width() || height != frame.height()
+                    || pixelFormat != frame.pixelFormat()) {
                 releaseTexture();
                 width = frame.width();
                 height = frame.height();
+                pixelFormat = frame.pixelFormat();
                 texture = new DynamicTexture(width, height, false);
                 location = Minecraft.getInstance().getTextureManager()
                         .register("video_synchronizer_screen", texture);
-                createPixelBuffers(frame.rgba().length);
+                createPixelBuffers(frame.data().length);
                 createdTexture = true;
-                Main.LOGGER.info("Created dynamic video texture {}x{}", width, height);
+                Main.LOGGER.info("Created dynamic video texture {}x{} ({})",
+                        width, height, pixelFormat);
             }
 
             if (createdTexture) {
-                uploadDirect(frame.rgba());
+                uploadDirect(frame.data(), frame.pixelFormat());
                 ClientVideoState.onFrameRendered(frame.positionMs());
                 return;
             }
-            if (pixelBufferUpload && uploadWithPixelBuffer(frame.rgba())) {
+            if (pixelBufferUpload && uploadWithPixelBuffer(
+                    frame.data(), frame.pixelFormat())) {
                 ClientVideoState.onFrameRendered(frame.positionMs());
                 return;
             }
@@ -137,14 +143,14 @@ public final class ScreenTexture {
                 deletePixelBuffers();
                 Main.LOGGER.warn("Mapped video texture upload is unavailable; using direct upload");
             }
-            uploadDirect(frame.rgba());
+            uploadDirect(frame.data(), frame.pixelFormat());
             ClientVideoState.onFrameRendered(frame.positionMs());
         } finally {
             VideoFrameBuffer.INSTANCE.release(frame);
         }
     }
 
-    private boolean uploadWithPixelBuffer(byte[] rgba) {
+    private boolean uploadWithPixelBuffer(byte[] data, VideoPixelFormat format) {
         int buffer = pixelBuffers[pixelBufferIndex];
         GL15.glBindBuffer(GL21.GL_PIXEL_UNPACK_BUFFER, buffer);
         try {
@@ -156,7 +162,7 @@ public final class ScreenTexture {
                         buffer, pixelBufferSize);
                 return false;
             }
-            mapped.put(rgba);
+            mapped.put(data);
             if (!GL15.glUnmapBuffer(GL21.GL_PIXEL_UNPACK_BUFFER)) {
                 Main.LOGGER.debug("Video PBO {} unmap reported corrupted contents", buffer);
                 return false;
@@ -166,38 +172,51 @@ public final class ScreenTexture {
             GL11.glPixelStorei(GL11.GL_UNPACK_ROW_LENGTH, 0);
             GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_ROWS, 0);
             GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_PIXELS, 0);
-            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, unpackAlignment(format));
             GL11.glTexSubImage2D(GL11.GL_TEXTURE_2D, 0, 0, 0, width, height,
-                    GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, 0L);
+                    glPixelFormat(format), GL11.GL_UNSIGNED_BYTE, 0L);
             pixelBufferIndex = (pixelBufferIndex + 1) % PIXEL_BUFFER_COUNT;
             statsPixelBufferUploads++;
             return true;
         } finally {
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
             GL15.glBindBuffer(GL21.GL_PIXEL_UNPACK_BUFFER, 0);
         }
     }
 
-    private void uploadDirect(byte[] rgba) {
+    private void uploadDirect(byte[] data, VideoPixelFormat format) {
         if (texture == null) {
             return;
         }
-        if (directUploadBuffer == null || directUploadBuffer.capacity() != rgba.length) {
+        if (directUploadBuffer == null || directUploadBuffer.capacity() != data.length) {
             releaseDirectUploadBuffer();
-            directUploadBuffer = MemoryUtil.memAlloc(rgba.length);
+            directUploadBuffer = MemoryUtil.memAlloc(data.length);
             Main.LOGGER.debug("Allocated direct video upload buffer (capacity={} bytes)",
-                    rgba.length);
+                    data.length);
         }
         directUploadBuffer.clear();
-        directUploadBuffer.put(rgba);
+        directUploadBuffer.put(data);
         directUploadBuffer.flip();
         texture.bind();
-        GL11.glPixelStorei(GL11.GL_UNPACK_ROW_LENGTH, 0);
-        GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_ROWS, 0);
-        GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_PIXELS, 0);
-        GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
-        GL11.glTexSubImage2D(GL11.GL_TEXTURE_2D, 0, 0, 0, width, height,
-                GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, directUploadBuffer);
+        try {
+            GL11.glPixelStorei(GL11.GL_UNPACK_ROW_LENGTH, 0);
+            GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_ROWS, 0);
+            GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_PIXELS, 0);
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, unpackAlignment(format));
+            GL11.glTexSubImage2D(GL11.GL_TEXTURE_2D, 0, 0, 0, width, height,
+                    glPixelFormat(format), GL11.GL_UNSIGNED_BYTE, directUploadBuffer);
+        } finally {
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
+        }
         statsDirectUploads++;
+    }
+
+    private static int glPixelFormat(VideoPixelFormat format) {
+        return format == VideoPixelFormat.RGB24 ? GL11.GL_RGB : GL11.GL_RGBA;
+    }
+
+    private static int unpackAlignment(VideoPixelFormat format) {
+        return format == VideoPixelFormat.RGB24 ? 1 : 4;
     }
 
     private void createPixelBuffers(int frameSize) {
@@ -304,6 +323,7 @@ public final class ScreenTexture {
         location = null;
         width = 0;
         height = 0;
+        pixelFormat = null;
     }
 
     private void releaseDirectUploadBuffer() {

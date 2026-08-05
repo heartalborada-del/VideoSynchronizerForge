@@ -11,23 +11,38 @@ import org.arkcraft.video_synchronizer.server.ServerVideoSession;
 
 import java.util.function.Supplier;
 
-public record OpenVideoManagerMessage(BlockPos pos, String screenId, String url,
-                                      boolean active, long positionMs, long durationMs,
-                                      boolean playing) {
+public record OpenVideoManagerMessage(BlockPos pos, String screenId, String videoUrl,
+                                      String audioUrl, String requestHeaders, String cookie,
+                                      boolean disableScaling, int videoPipeLanes,
+                                      VideoPixelFormat videoPixelFormat,
+                                      boolean active, long positionMs, long durationMs, boolean playing,
+                                      boolean waitingForClients) {
     public void encode(FriendlyByteBuf buf) {
         buf.writeBlockPos(pos);
         buf.writeUtf(screenId, 32);
-        buf.writeUtf(url, 2048);
+        buf.writeUtf(videoUrl, 2048);
+        buf.writeUtf(audioUrl, 2048);
+        buf.writeUtf(requestHeaders, MediaRequestOptions.MAX_HEADERS_LENGTH);
+        buf.writeUtf(cookie, MediaRequestOptions.MAX_COOKIE_LENGTH);
+        buf.writeBoolean(disableScaling);
+        buf.writeVarInt(videoPipeLanes);
+        buf.writeEnum(videoPixelFormat);
         buf.writeBoolean(active);
         buf.writeLong(positionMs);
         buf.writeLong(durationMs);
         buf.writeBoolean(playing);
+        buf.writeBoolean(waitingForClients);
     }
 
     public static OpenVideoManagerMessage decode(FriendlyByteBuf buf) {
         return new OpenVideoManagerMessage(buf.readBlockPos(), buf.readUtf(32),
-                buf.readUtf(2048), buf.readBoolean(), buf.readLong(), buf.readLong(),
-                buf.readBoolean());
+                buf.readUtf(2048), buf.readUtf(2048),
+                buf.readUtf(MediaRequestOptions.MAX_HEADERS_LENGTH),
+                buf.readUtf(MediaRequestOptions.MAX_COOKIE_LENGTH), buf.readBoolean(),
+                buf.readVarInt(),
+                buf.readEnum(VideoPixelFormat.class),
+                buf.readBoolean(),
+                buf.readLong(), buf.readLong(), buf.readBoolean(), buf.readBoolean());
     }
 
     public static void handle(OpenVideoManagerMessage message,
@@ -38,9 +53,21 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String url,
     public static void send(ServerPlayer player, BlockPos pos,
                             VideoManagerBlockEntity manager) {
         ServerVideoSession.ControlState state = ServerVideoSession.controlState(manager.getScreenId());
-        String url = state.active() ? state.url() : manager.getMediaUrl();
+        String videoUrl = state.active() ? state.videoUrl() : manager.getVideoUrl();
+        String audioUrl = state.active() ? state.audioUrl() : manager.getAudioUrl();
+        String requestHeaders = state.active()
+                ? state.requestHeaders() : manager.getRequestHeaders();
+        String cookie = state.active() ? state.cookie() : manager.getCookie();
+        boolean disableScaling = state.active()
+                ? state.disableScaling() : manager.isScalingDisabled();
+        int videoPipeLanes = state.active()
+                ? state.videoPipeLanes() : manager.getVideoPipeLanes();
+        VideoPixelFormat videoPixelFormat = state.active()
+                ? state.videoPixelFormat() : manager.getVideoPixelFormat();
         VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
-                new OpenVideoManagerMessage(pos, manager.getScreenId(), url,
-                        state.active(), state.positionMs(), state.durationMs(), state.playing()));
+                new OpenVideoManagerMessage(pos, manager.getScreenId(), videoUrl, audioUrl,
+                        requestHeaders, cookie, disableScaling, videoPipeLanes, videoPixelFormat,
+                        state.active(), state.positionMs(), state.durationMs(), state.playing(),
+                        state.waitingForClients()));
     }
 }

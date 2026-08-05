@@ -25,11 +25,12 @@ preserving a smooth and synchronized playback experience for every player.
 - Minecraft Forge 1.20.1
 - Java 17
 - Gradle 8.x for building; ForgeGradle is incompatible with Gradle 9
-- FFmpeg and ffprobe on `PATH` for platforms without an embedded build
+- FFmpeg and ffprobe on `PATH` when using the `no-ffmpeg` build
 
-Windows x64 clients use the bundled LGPL FFmpeg build, extracted on first launch to
-`<Minecraft game directory>/video_synchronizer/ffmpeg/`. Other platforms currently use
-`ffmpeg` and `ffprobe` from `PATH`.
+Release JARs are provided for Linux and Windows on AMD64 and ARM64. Each platform build
+contains the matching BtbN FFmpeg LGPL shared distribution, extracted on first launch to
+`<Minecraft game directory>/video_synchronizer/ffmpeg/`. A platform-independent
+`no-ffmpeg` JAR uses `ffmpeg` and `ffprobe` from `PATH` instead.
 
 ## Quick start
 
@@ -42,8 +43,9 @@ Look at a loaded wall, floor, or ceiling within 32 blocks and create a screen:
 
 Adjacent screen blocks with the same facing form one display. Right-click a screen to
 bind its ID; sneak-right-click to place another screen against it. The Video Manager can
-control a loaded screen in another location or dimension. Screen and manager blocks have
-no recipe or loot and are available through the creative tab, `/give`, or `/video create`.
+control a loaded screen in another location or dimension and faces the player when placed.
+Screen and manager blocks have no recipe or loot and are available through the creative
+tab, `/give`, or `/video create`.
 
 Status commands are available to every player. Other controls require permission level 2:
 
@@ -69,8 +71,13 @@ Manager accepts seek positions in `HH:MM:SS` format.
 
 - New sessions and explicit seeks start after a verified frame is ready on at least 80%
   of online clients. Reconnecting players receive the active session and screen layout.
-- Temporary video or audio disconnections rebuild the affected decoder from the current
-  synchronized position. Fatal HTTP responses stop the session and show the status code.
+- A joining player's progress is admitted only after two reports closely match the
+  authoritative clock, and normal playback reports cannot move that clock backward.
+- If established video or audio output stalls, both decoders restart together from the
+  current synchronized position so one stream cannot continue drifting away from the other.
+  Fatal HTTP responses stop the session and show the status code.
+- Reaching the known media duration automatically stops the server session and closes every
+  client's FFmpeg processes.
 - Request headers and Cookies can be configured for authenticated sources. They are sent
   to every client and may appear in local process arguments, so do not use credentials
   that connected players must not receive. Sensitive media values are omitted from
@@ -120,7 +127,17 @@ gradle build
 gradle runClient
 ```
 
-The first build downloads and verifies the pinned Windows x64 FFmpeg bundle before
-packaging it into the mod JAR. Third-party details are stored in
-`META-INF/third-party/ffmpeg-windows-x86_64.txt`. For runtime checks, inspect
-`run/logs/latest.log` and `run/logs/debug.log`.
+The default build embeds Windows AMD64 FFmpeg. Select a release variant with:
+
+```text
+gradle build -PembeddedFfmpegPlatform=linux-aarch64
+gradle build -PembeddedFfmpegPlatform=linux-x86_64
+gradle build -PembeddedFfmpegPlatform=windows-aarch64
+gradle build -PembeddedFfmpegPlatform=windows-x86_64
+gradle build -PembeddedFfmpegPlatform=none
+```
+
+Embedded archives use pinned SHA-256 values and include the LGPL v3 license and
+third-party notice. Pushing a `v*` tag runs the GitHub Actions release workflow, builds
+all five variants, writes `SHA256SUMS`, and creates a GitHub Release. For runtime checks,
+inspect `run/logs/latest.log` and `run/logs/debug.log`.
