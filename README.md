@@ -17,6 +17,7 @@ preserving a smooth and synchronized playback experience for every player.
 - Continuous screens on walls, floors, and ceilings, up to 256 × 256 blocks.
 - HTTP(S) MP4, HLS, and split DASH video/audio support through FFmpeg.
 - Commands and an in-world Video Manager GUI for playback control.
+- Batch text import for HTTP request headers and Cookies in the Video Manager.
 - Hardware decoding with software fallback and automatic scaling for large videos.
 
 ## Requirements
