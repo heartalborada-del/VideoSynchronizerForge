@@ -89,12 +89,17 @@ public final class ScreenBlockEntityRenderer implements BlockEntityRenderer<Scre
 
     private void renderVideoTile(ClientScreenTarget.RenderTile tile, ScreenOrientation orientation,
                                  PoseStack.Pose pose, MultiBufferSource buffers) {
-        ResourceLocation texture = ScreenTexture.INSTANCE.get();
+        ScreenTexture screenTexture = ScreenTexture.forSession(tile.sessionId());
+        if (screenTexture == null) {
+            statsMissingTexture++;
+            return;
+        }
+        ResourceLocation texture = screenTexture.get();
         if (texture == null) {
             statsMissingTexture++;
             return;
         }
-        Fit fit = fit(tile.screenWidth(), tile.screenHeight(), ScreenTexture.INSTANCE.aspectRatio());
+        Fit fit = fit(tile.screenWidth(), tile.screenHeight(), screenTexture.aspectRatio());
         float globalX0 = Math.max(fit.x0, tile.column());
         float globalX1 = Math.min(fit.x1, tile.column() + tile.width());
         float globalY0 = Math.max(fit.y0, tile.row());

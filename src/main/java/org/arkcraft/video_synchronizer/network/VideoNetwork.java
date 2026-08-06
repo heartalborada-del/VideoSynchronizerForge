@@ -8,7 +8,7 @@ import org.arkcraft.video_synchronizer.Main;
 
 /** The single protocol used by both sides of a video session. */
 public final class VideoNetwork {
-    private static final String PROTOCOL = "17";
+    private static final String PROTOCOL = "21";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(Main.MODID, "sync"),
             () -> PROTOCOL,
@@ -43,9 +43,16 @@ public final class VideoNetwork {
                 .encoder(VideoClientCapabilityMessage::encode)
                 .decoder(VideoClientCapabilityMessage::decode)
                 .consumerMainThread(VideoClientCapabilityMessage::handle).add();
-        CHANNEL.messageBuilder(VideoHttpErrorMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
-                .encoder(VideoHttpErrorMessage::encode).decoder(VideoHttpErrorMessage::decode)
-                .consumerMainThread(VideoHttpErrorMessage::handle).add();
+        CHANNEL.messageBuilder(VideoPlaybackErrorMessage.class, nextId++,
+                        NetworkDirection.PLAY_TO_SERVER)
+                .encoder(VideoPlaybackErrorMessage::encode)
+                .decoder(VideoPlaybackErrorMessage::decode)
+                .consumerMainThread(VideoPlaybackErrorMessage::handle).add();
+        CHANNEL.messageBuilder(VideoPlaybackNoticeMessage.class, nextId++,
+                        NetworkDirection.PLAY_TO_CLIENT)
+                .encoder(VideoPlaybackNoticeMessage::encode)
+                .decoder(VideoPlaybackNoticeMessage::decode)
+                .consumerMainThread(VideoPlaybackNoticeMessage::handle).add();
         CHANNEL.messageBuilder(VideoLocalPauseMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
                 .encoder(VideoLocalPauseMessage::encode).decoder(VideoLocalPauseMessage::decode)
                 .consumerMainThread(VideoLocalPauseMessage::handle).add();

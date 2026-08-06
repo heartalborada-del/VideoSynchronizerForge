@@ -2,7 +2,7 @@ package org.arkcraft.video_synchronizer.network;
 
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraftforge.network.NetworkEvent;
-import org.arkcraft.video_synchronizer.server.ServerVideoSession;
+import org.arkcraft.video_synchronizer.server.ServerVideoSessionManager;
 
 import java.util.function.Supplier;
 
@@ -18,7 +18,7 @@ public record VideoResyncMessage(String sessionId) {
     public static void handle(VideoResyncMessage message, Supplier<NetworkEvent.Context> context) {
         var sender = context.get().getSender();
         if (sender != null) {
-            ServerVideoSession.sendCurrent(sender);
+            ServerVideoSessionManager.sendCurrent(sender);
         }
     }
 }

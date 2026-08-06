@@ -24,9 +24,6 @@ public final class ClientVideoSetup {
             CompletableFuture.supplyAsync(FfmpegPlaybackAdapter::prepareExecutables)
                     .thenAccept(available -> Minecraft.getInstance().execute(() -> {
                         ClientVideoState.setPlaybackAvailability(available);
-                        if (available) {
-                            ClientVideoState.setPlaybackAdapter(FfmpegPlaybackAdapter.INSTANCE);
-                        }
                     }));
         });
     }

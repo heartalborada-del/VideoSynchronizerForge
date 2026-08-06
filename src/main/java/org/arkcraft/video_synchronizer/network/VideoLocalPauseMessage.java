@@ -2,7 +2,7 @@ package org.arkcraft.video_synchronizer.network;
 
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraftforge.network.NetworkEvent;
-import org.arkcraft.video_synchronizer.server.ServerVideoSession;
+import org.arkcraft.video_synchronizer.server.ServerVideoSessionManager;
 
 import java.util.function.Supplier;
 
@@ -22,7 +22,7 @@ public record VideoLocalPauseMessage(String sessionId, long sequence, long durat
                               Supplier<NetworkEvent.Context> context) {
         var sender = context.get().getSender();
         if (sender != null) {
-            ServerVideoSession.acceptLocalPause(sender, message);
+            ServerVideoSessionManager.acceptLocalPause(sender, message);
         }
     }
 }

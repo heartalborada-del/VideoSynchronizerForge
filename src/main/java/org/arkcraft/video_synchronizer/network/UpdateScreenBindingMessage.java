@@ -5,7 +5,7 @@ import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.chat.Component;
 import net.minecraftforge.network.NetworkEvent;
 import org.arkcraft.video_synchronizer.server.ServerScreenRegistry;
-import org.arkcraft.video_synchronizer.server.ServerVideoSession;
+import org.arkcraft.video_synchronizer.server.ServerVideoSessionManager;
 
 import java.util.function.Supplier;
 
@@ -29,10 +29,10 @@ public record UpdateScreenBindingMessage(BlockPos pos, String screenId, boolean 
         try {
             if (message.bind()) {
                 String id = ServerScreenRegistry.assignGroup(sender.serverLevel(), message.pos(), message.screenId());
-                ServerVideoSession.bindScreen(sender.getServer(), sender.serverLevel(), message.pos());
+                ServerVideoSessionManager.bindScreen(sender.getServer(), sender.serverLevel(), message.pos());
                 sender.sendSystemMessage(Component.literal("Bound video screen: " + id));
             } else {
-                ServerVideoSession.unbindScreen(sender.getServer());
+                ServerVideoSessionManager.unbindScreen(sender.getServer());
                 sender.sendSystemMessage(Component.literal("Video screen unbound"));
             }
         } catch (IllegalArgumentException exception) {

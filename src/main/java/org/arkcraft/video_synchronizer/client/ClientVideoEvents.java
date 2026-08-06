@@ -25,7 +25,7 @@ public final class ClientVideoEvents {
     @SubscribeEvent
     public static void onRenderTick(TickEvent.RenderTickEvent event) {
         if (event.phase == TickEvent.Phase.START) {
-            ScreenTexture.INSTANCE.update();
+            ScreenTexture.updateAll();
         }
         // Render ticks continue while the single-player pause screen is open. Check
         // both phases because Minecraft updates its internal pause flag during a frame.

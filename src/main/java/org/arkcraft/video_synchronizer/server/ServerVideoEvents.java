@@ -29,35 +29,35 @@ public final class ServerVideoEvents {
     @SubscribeEvent
     public static void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase == TickEvent.Phase.END) {
-            ServerVideoSession.tick(event.getServer());
+            ServerVideoSessionManager.tick(event.getServer());
         }
     }
 
     @SubscribeEvent
     public static void onPlayerLogin(PlayerEvent.PlayerLoggedInEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
-            ServerVideoSession.sendCurrent(player);
+            ServerVideoSessionManager.sendCurrent(player);
         }
     }
 
     @SubscribeEvent
     public static void onPlayerLogout(PlayerEvent.PlayerLoggedOutEvent event) {
-        ServerVideoSession.playerDisconnected(event.getEntity().getUUID());
+        ServerVideoSessionManager.playerDisconnected(event.getEntity().getUUID());
     }
 
     @SubscribeEvent
     public static void onServerStopped(ServerStoppedEvent event) {
-        ServerVideoSession.reset();
+        ServerVideoSessionManager.reset();
         ServerScreenRegistry.clear();
     }
 
     @SubscribeEvent
     public static void onBlockBreak(BlockEvent.BreakEvent event) {
         if (event.getLevel() instanceof ServerLevel level
-                && ServerVideoSession.isPlaybackProtected(level, event.getPos())) {
+                && ServerVideoSessionManager.isPlaybackProtected(level, event.getPos())) {
             event.setCanceled(true);
             event.getPlayer().displayClientMessage(Component.translatable(
-                    "message.video_synchronizer.playback_protected"), true);
+                    "message.video_synchronizer.playback_protected"), false);
         }
     }
 
@@ -65,14 +65,14 @@ public final class ServerVideoEvents {
     public static void onExplosionDetonate(ExplosionEvent.Detonate event) {
         if (event.getLevel() instanceof ServerLevel level) {
             event.getAffectedBlocks().removeIf(
-                    pos -> ServerVideoSession.isPlaybackProtected(level, pos));
+                    pos -> ServerVideoSessionManager.isPlaybackProtected(level, pos));
         }
     }
 
     @SubscribeEvent
     public static void onLivingDestroyBlock(LivingDestroyBlockEvent event) {
         if (event.getEntity().level() instanceof ServerLevel level
-                && ServerVideoSession.isPlaybackProtected(level, event.getPos())) {
+                && ServerVideoSessionManager.isPlaybackProtected(level, event.getPos())) {
             event.setCanceled(true);
         }
     }
@@ -88,7 +88,7 @@ public final class ServerVideoEvents {
                                                     try {
                                                         String id = StringArgumentType.getString(context, "video_id");
                                                         String url = StringArgumentType.getString(context, "url");
-                                                        ServerVideoSession.start(
+                                                        ServerVideoSessionManager.start(
                                                                 context.getSource().getServer(), id, url);
                                                         context.getSource().sendSuccess(
                                                                 () -> Component.literal("Started video " + id), true);
@@ -116,7 +116,7 @@ public final class ServerVideoEvents {
                                                         var anchor = ScreenCreator.create(player, width, height);
                                                         id = ServerScreenRegistry.assignGroup(
                                                                 player.serverLevel(), anchor, id);
-                                                        ServerVideoSession.bindScreen(
+                                                        ServerVideoSessionManager.bindScreen(
                                                                 context.getSource().getServer(),
                                                                 player.serverLevel(), anchor);
                                                         String resultId = id;
@@ -133,19 +133,19 @@ public final class ServerVideoEvents {
                                                 })))))
                 .then(Commands.literal("pause")
                         .requires(source -> source.hasPermission(2)).executes(context -> {
-                    ServerVideoSession.setPlaying(context.getSource().getServer(), false);
+                    ServerVideoSessionManager.setPlaying(context.getSource().getServer(), false);
                     return 1;
                 }))
                 .then(Commands.literal("resume")
                         .requires(source -> source.hasPermission(2)).executes(context -> {
-                    ServerVideoSession.setPlaying(context.getSource().getServer(), true);
+                    ServerVideoSessionManager.setPlaying(context.getSource().getServer(), true);
                     return 1;
                 }))
                 .then(Commands.literal("seek")
                         .requires(source -> source.hasPermission(2))
                         .then(Commands.argument("milliseconds", LongArgumentType.longArg(0L))
                                 .executes(context -> {
-                                    ServerVideoSession.seek(context.getSource().getServer(),
+                                    ServerVideoSessionManager.seek(context.getSource().getServer(),
                                             LongArgumentType.getLong(context, "milliseconds"));
                                     return 1;
                                 })))
@@ -156,7 +156,7 @@ public final class ServerVideoEvents {
                                         .executes(context -> {
                                             ServerPlayer player = EntityArgument.getPlayer(context, "player");
                                             double weight = DoubleArgumentType.getDouble(context, "value");
-                                            ServerVideoSession.setPlayerWeight(player.getUUID(), weight);
+                                            ServerVideoSessionManager.setPlayerWeight(player.getUUID(), weight);
                                             context.getSource().sendSuccess(() -> Component.literal(
                                                     "Set " + player.getGameProfile().getName()
                                                             + " weight to " + weight), true);
@@ -168,7 +168,7 @@ public final class ServerVideoEvents {
                                 .executes(context -> {
                                     try {
                                         String id = StringArgumentType.getString(context, "screen_id");
-                                        ServerVideoSession.bindScreen(context.getSource().getServer(), id);
+                                        ServerVideoSessionManager.bindScreen(context.getSource().getServer(), id);
                                         context.getSource().sendSuccess(() -> Component.literal(
                                                 "Bound video playback to screen " + id), true);
                                         return 1;
@@ -179,18 +179,18 @@ public final class ServerVideoEvents {
                                 })))
                 .then(Commands.literal("unbind")
                         .requires(source -> source.hasPermission(2)).executes(context -> {
-                    ServerVideoSession.unbindScreen(context.getSource().getServer());
+                    ServerVideoSessionManager.unbindScreen(context.getSource().getServer());
                     context.getSource().sendSuccess(() -> Component.literal("Video screen binding cleared"), true);
                     return 1;
                 }))
                 .then(Commands.literal("stop")
                         .requires(source -> source.hasPermission(2)).executes(context -> {
-                    ServerVideoSession.stop();
+                    ServerVideoSessionManager.stop();
                     return 1;
                 }))
                 .then(Commands.literal("status")
                         .executes(context -> {
-                            context.getSource().sendSuccess(() -> ServerVideoSession.describe(
+                            context.getSource().sendSuccess(() -> ServerVideoSessionManager.describe(
                                     context.getSource().getServer(),
                                     context.getSource().getPlayer()), false);
                             return 1;
@@ -199,7 +199,7 @@ public final class ServerVideoEvents {
                                 .requires(source -> source.getEntity() instanceof ServerPlayer)
                                 .executes(context -> {
                                     ServerPlayer player = context.getSource().getPlayerOrException();
-                                    boolean enabled = ServerVideoSession.toggleStatusBossBar(player);
+                                    boolean enabled = ServerVideoSessionManager.toggleStatusBossBar(player);
                                     context.getSource().sendSuccess(() -> Component.translatable(enabled
                                             ? "command.video_synchronizer.bossbar.enabled"
                                             : "command.video_synchronizer.bossbar.disabled"), false);

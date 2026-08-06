@@ -5,12 +5,15 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import org.arkcraft.video_synchronizer.Main;
 import org.arkcraft.video_synchronizer.client.gui.VideoManagerScreen;
+import org.arkcraft.video_synchronizer.client.player.FfmpegPlaybackAdapter;
 import org.arkcraft.video_synchronizer.network.VideoClientCapabilityMessage;
-import org.arkcraft.video_synchronizer.network.VideoNetwork;
+import org.arkcraft.video_synchronizer.network.AudioPlaybackMode;
 import org.arkcraft.video_synchronizer.network.VideoLocalPauseMessage;
-import org.arkcraft.video_synchronizer.network.VideoHttpErrorMessage;
-import org.arkcraft.video_synchronizer.network.VideoProgressMessage;
+import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.VideoPlaybackErrorMessage;
+import org.arkcraft.video_synchronizer.network.VideoPlaybackNoticeMessage;
+import org.arkcraft.video_synchronizer.network.VideoProgressMessage;
 import org.arkcraft.video_synchronizer.network.VideoReadyMessage;
 import org.arkcraft.video_synchronizer.network.VideoResyncMessage;
 import org.arkcraft.video_synchronizer.network.VideoStartMessage;
@@ -20,9 +23,11 @@ import org.arkcraft.video_synchronizer.network.VideoTimeSyncRequestMessage;
 import org.arkcraft.video_synchronizer.network.VideoTimeSyncResponseMessage;
 
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
-/** Client-side bridge between the network and whichever video player the mod uses. */
+/** Client-side bridge managing one decoder and clock per synchronized session. */
 public final class ClientVideoState {
     public static final long HARD_SEEK_THRESHOLD_MS = 750L;
     private static final int REPORT_INTERVAL_TICKS = 20;
@@ -33,58 +38,27 @@ public final class ClientVideoState {
     private static final long MAX_TIME_SYNC_ROUND_TRIP_NANOS = TimeUnit.SECONDS.toNanos(5L);
     private static final long MAX_PACKET_AGE_NANOS = TimeUnit.SECONDS.toNanos(30L);
     private static final long PROGRESS_SWITCH_DISPLAY_NANOS = TimeUnit.SECONDS.toNanos(2L);
+    private static final long PLAYBACK_NOTICE_DISPLAY_NANOS = TimeUnit.SECONDS.toNanos(5L);
+    private static final double LOAD_HYSTERESIS_BLOCKS = 4.0D;
 
-    private static PlaybackAdapter adapter;
+    private static final Map<String, SessionState> SESSIONS = new ConcurrentHashMap<>();
     private static boolean playbackAvailabilityKnown;
     private static boolean playbackAvailable;
     private static boolean capabilityReported;
     private static boolean availabilityNoticeShown;
-    private static String sessionId;
-    private static String videoId;
-    private static String videoUrl;
-    private static String audioUrl;
-    private static String requestHeaders;
-    private static String cookie;
-    private static boolean disableScaling;
-    private static int videoPipeLanes;
-    private static VideoPixelFormat videoPixelFormat = VideoPixelFormat.RGB24;
-    private static long durationMs;
-    private static long positionMs;
-    private static boolean playing;
-    private static boolean waitingForClients;
-    private static boolean readinessReported;
     private static boolean clientPaused;
     private static long clientPauseStartedNanos;
     private static long clientPauseSequence;
-    private static String clientPauseSessionId;
-    private static long revision;
-    private static int ticksSinceReport;
-    private static long lastReportNanos;
     private static long lastTimeSyncRequestNanos;
     private static long timeSyncWindowStartedNanos;
     private static long bestTimeSyncRoundTripNanos = Long.MAX_VALUE;
     private static long serverClockOffsetNanos;
     private static boolean serverClockSynchronized;
-    private static int pendingCorrectionDirection;
-    private static int pendingCorrectionCount;
     private static boolean progressOverlayVisible;
-    private static long progressSwitchFromMs;
-    private static long progressSwitchToMs;
-    private static long progressSwitchUntilNanos;
+    private static Component playbackNotice;
+    private static long playbackNoticeExpiresNanos;
 
     private ClientVideoState() {
-    }
-
-    public static void setPlaybackAdapter(PlaybackAdapter playbackAdapter) {
-        adapter = playbackAdapter;
-        Main.LOGGER.debug("Client playback adapter set to {} (activeSession={})",
-                adapter == null ? "none" : adapter.getClass().getSimpleName(), sessionId != null);
-        if (adapter != null && sessionId != null) {
-            adapter.open(videoId, videoUrl, audioUrl, requestHeaders, cookie, disableScaling,
-                    videoPipeLanes, videoPixelFormat, durationMs);
-            adapter.applyServerState(positionMs, playing, waitingForClients, true);
-            adapter.setClientPaused(clientPaused);
-        }
     }
 
     public static void setPlaybackAvailability(boolean available) {
@@ -92,9 +66,13 @@ public final class ClientVideoState {
         playbackAvailable = available;
         capabilityReported = false;
         availabilityNoticeShown = false;
-        if (!available && adapter != null) {
-            adapter.close();
-            adapter = null;
+        if (!available) {
+            SESSIONS.values().forEach(session -> {
+                if (session.adapter != null) {
+                    session.adapter.dispose();
+                    session.adapter = null;
+                }
+            });
         }
         maybeReportPlaybackCapability();
     }
@@ -104,197 +82,237 @@ public final class ClientVideoState {
     }
 
     public static void acceptStart(VideoStartMessage message) {
-        if (sessionId != null && sessionId.equals(message.sessionId()) && message.revision() < revision) {
+        SessionState session = SESSIONS.computeIfAbsent(message.sessionId(), SessionState::new);
+        if (message.revision() < session.revision) {
             return;
         }
-        boolean sameSession = message.sessionId().equals(sessionId);
-        if (!sameSession) {
-            progressSwitchUntilNanos = 0L;
+        boolean sameSession = session.initialized;
+        session.videoId = message.videoId();
+        session.videoUrl = message.videoUrl();
+        session.audioUrl = message.audioUrl();
+        session.requestHeaders = message.requestHeaders();
+        session.cookie = message.cookie();
+        session.disableScaling = message.disableScaling();
+        session.videoPipeLanes = message.videoPipeLanes();
+        session.videoPixelFormat = message.videoPixelFormat();
+        session.audioRange = message.audioRange();
+        session.audioPlaybackMode = message.audioPlaybackMode();
+        session.durationMs = message.durationMs();
+        session.positionMs = clampToDuration(session, compensatedServerPosition(
+                message.positionMs(), message.playing(), message.waitingForClients(),
+                message.sentAtNanos(), message.receivedAtNanos()));
+        session.playing = message.playing();
+        session.waitingForClients = message.waitingForClients();
+        if (!sameSession || session.waitingForClients) {
+            session.readinessReported = false;
         }
-        ClientScreenTarget.resetForSession(message.sessionId());
-        sessionId = message.sessionId();
-        videoId = message.videoId();
-        videoUrl = message.videoUrl();
-        audioUrl = message.audioUrl();
-        requestHeaders = message.requestHeaders();
-        cookie = message.cookie();
-        disableScaling = message.disableScaling();
-        videoPipeLanes = message.videoPipeLanes();
-        videoPixelFormat = message.videoPixelFormat();
-        durationMs = message.durationMs();
-        if (!sameSession) {
-            resetTimeSync();
-        }
-        positionMs = compensatedServerPosition(message.positionMs(), message.playing(),
-                message.waitingForClients(), message.sentAtNanos(), message.receivedAtNanos());
-        playing = message.playing();
-        waitingForClients = message.waitingForClients();
-        if (!sameSession || waitingForClients) {
-            readinessReported = false;
-        }
-        revision = message.revision();
-        ticksSinceReport = REPORT_INTERVAL_TICKS;
-        clearPendingCorrection();
-        if (!sameSession) {
-            lastReportNanos = 0L;
-        }
-        if (playbackAvailable) {
-            maybeRequestTimeSync();
-        }
-        if (!sameSession && clientPaused) {
-            clientPauseStartedNanos = System.nanoTime();
-            clientPauseSessionId = sessionId;
-        }
-        Main.LOGGER.debug("Accepted video start: session={}, videoId={}, position={} ms, "
+        session.revision = message.revision();
+        session.ticksSinceReport = REPORT_INTERVAL_TICKS;
+        session.lastReportNanos = 0L;
+        session.clearPendingCorrection();
+        session.initialized = true;
+        Main.LOGGER.debug("Accepted video session: session={}, videoId={}, position={} ms, "
                         + "duration={} ms, playing={}, waitingForClients={}, revision={}, "
-                        + "sameSession={}",
-                sessionId, videoId, positionMs, durationMs, playing, waitingForClients,
-                revision, sameSession);
-        if (adapter != null) {
+                        + "sameSession={}", session.sessionId, session.videoId, session.positionMs,
+                session.durationMs, session.playing, session.waitingForClients,
+                session.revision, sameSession);
+        if (session.adapter != null) {
             if (!sameSession) {
-                adapter.open(videoId, videoUrl, audioUrl, requestHeaders, cookie, disableScaling,
-                        videoPipeLanes, videoPixelFormat, durationMs);
+                session.adapter.open(session.videoId, session.videoUrl, session.audioUrl,
+                        session.requestHeaders, session.cookie, session.disableScaling,
+                        session.videoPipeLanes, session.videoPixelFormat, session.audioRange,
+                        session.audioPlaybackMode,
+                        session.durationMs);
             }
-            adapter.applyServerState(positionMs, playing, waitingForClients, true);
-            adapter.setClientPaused(clientPaused);
+            session.adapter.applyServerState(session.positionMs, session.playing,
+                    session.waitingForClients, true);
+            session.adapter.setClientPaused(clientPaused);
         }
     }
 
     public static void acceptState(VideoStateMessage message) {
-        if (sessionId == null || !sessionId.equals(message.sessionId())) {
+        SessionState session = SESSIONS.get(message.sessionId());
+        if (session == null || !session.initialized) {
             VideoNetwork.CHANNEL.sendToServer(new VideoResyncMessage(message.sessionId()));
             return;
         }
-        if (message.revision() < revision) {
+        if (message.revision() < session.revision) {
             return;
         }
         if (message.durationMs() > 0L) {
-            durationMs = message.durationMs();
+            session.durationMs = message.durationMs();
         }
-        long serverPosition = compensatedServerPosition(message.positionMs(), message.playing(),
-                message.waitingForClients(), message.sentAtNanos(), message.receivedAtNanos());
-        long clientPosition = adapter == null ? positionMs : clampToDuration(adapter.positionMs());
-        // Routine snapshots can reflect transient network delay. Require the same
-        // correction direction twice; explicit hard seeks bypass this debounce.
-        boolean driftRequiresSeek = adapter != null && adapter.isPlaybackClockStarted()
+        long serverPosition = clampToDuration(session, compensatedServerPosition(
+                message.positionMs(), message.playing(), message.waitingForClients(),
+                message.sentAtNanos(), message.receivedAtNanos()));
+        long clientPosition = session.adapter == null
+                ? session.positionMs : clampToDuration(session, session.adapter.positionMs());
+        boolean driftRequiresSeek = session.adapter != null && session.adapter.isPlaybackClockStarted()
                 && Math.abs(serverPosition - clientPosition) >= HARD_SEEK_THRESHOLD_MS;
-        boolean hardSeek = message.hardSeek() || confirmRoutineCorrection(
+        boolean hardSeek = message.hardSeek() || session.confirmRoutineCorrection(
                 serverPosition, clientPosition, driftRequiresSeek);
         if (message.hardSeek()) {
-            clearPendingCorrection();
+            session.clearPendingCorrection();
         }
-        if (hardSeek && adapter != null && adapter.isPlaybackClockStarted()
+        if (hardSeek && session.adapter != null && session.adapter.isPlaybackClockStarted()
                 && clientPosition != serverPosition) {
-            showProgressSwitch(clientPosition, serverPosition);
+            session.showProgressSwitch(clientPosition, serverPosition);
         }
-        positionMs = serverPosition;
-        playing = message.playing();
-        waitingForClients = message.waitingForClients();
-        if (waitingForClients && message.hardSeek()) {
-            readinessReported = false;
+        session.positionMs = serverPosition;
+        session.playing = message.playing();
+        session.waitingForClients = message.waitingForClients();
+        if (session.waitingForClients && message.hardSeek()) {
+            session.readinessReported = false;
         }
-        revision = message.revision();
-        if (adapter != null) {
-            adapter.applyServerState(positionMs, playing, waitingForClients, hardSeek);
+        session.revision = message.revision();
+        if (session.adapter != null) {
+            session.adapter.applyServerState(session.positionMs, session.playing,
+                    session.waitingForClients, hardSeek);
         }
-        VideoManagerScreen.acceptPlaybackState(
-                positionMs, durationMs, playing, waitingForClients);
+        String screenId = ClientScreenTarget.screenId(session.sessionId);
+        VideoManagerScreen.acceptPlaybackState(screenId == null ? session.videoId : screenId,
+                session.positionMs, session.durationMs,
+                session.playing, session.waitingForClients);
     }
 
     public static void acceptStop(VideoStopMessage message) {
-        if (sessionId == null || !sessionId.equals(message.sessionId())) {
+        SessionState session = SESSIONS.remove(message.sessionId());
+        if (session == null) {
             return;
         }
-        if (adapter != null) {
-            adapter.close();
+        String screenId = ClientScreenTarget.screenId(session.sessionId);
+        if (session.adapter != null) {
+            session.adapter.dispose();
         }
+        ClientScreenTarget.clear(message.sessionId());
+        VideoManagerScreen.acceptStop(screenId == null ? session.videoId : screenId);
         Main.LOGGER.debug("Accepted video stop: session={}", message.sessionId());
-        sessionId = null;
-        videoId = null;
-        videoUrl = null;
-        audioUrl = null;
-        requestHeaders = null;
-        cookie = null;
-        disableScaling = false;
-        videoPipeLanes = 0;
-        videoPixelFormat = VideoPixelFormat.RGB24;
-        durationMs = 0L;
-        positionMs = 0L;
-        playing = false;
-        waitingForClients = false;
-        readinessReported = false;
-        clientPauseSessionId = null;
-        revision = 0L;
-        ticksSinceReport = 0;
-        lastReportNanos = 0L;
-        resetTimeSync();
-        clearPendingCorrection();
-        VideoManagerScreen.acceptStop();
-        clearProgressOverlay();
-        ClientScreenTarget.clear();
+        if (SESSIONS.isEmpty()) {
+            clearProgressOverlay();
+        }
+    }
+
+    public static void acceptPlaybackNotice(VideoPlaybackNoticeMessage message) {
+        String translationKey;
+        if (message.reason() == VideoPlaybackErrorMessage.Reason.AUDIO_UNPLAYABLE) {
+            translationKey = "message.video_synchronizer.audio_unplayable";
+        } else if (message.reason() == VideoPlaybackErrorMessage.Reason.VIDEO_UNPLAYABLE) {
+            translationKey = "message.video_synchronizer.video_unplayable";
+        } else {
+            return;
+        }
+        playbackNotice = Component.translatable(translationKey, message.videoId())
+                .withStyle(ChatFormatting.RED, ChatFormatting.BOLD);
+        playbackNoticeExpiresNanos = System.nanoTime() + PLAYBACK_NOTICE_DISPLAY_NANOS;
+        updateProgressOverlay();
     }
 
     public static void clientTick() {
         maybeReportPlaybackCapability();
         maybeShowPlaybackUnavailableNotice();
-        if (sessionId == null) {
-            return;
-        }
-        updateProgressOverlay();
-        if (!playbackAvailable) {
+        if (SESSIONS.isEmpty()) {
+            updateProgressOverlay();
             return;
         }
         maybeRequestTimeSync();
-        if (adapter != null) {
-            adapter.clientTick();
-        }
-        if (clientPaused) {
-            return;
-        }
-        if (waitingForClients) {
-            if (adapter != null) {
-                long adapterDuration = adapter.durationMs();
+        for (SessionState session : SESSIONS.values()) {
+            updateSessionLoading(session);
+            if (!playbackAvailable || session.adapter == null) {
+                continue;
+            }
+            session.adapter.clientTick();
+            if (clientPaused) {
+                continue;
+            }
+            if (session.waitingForClients) {
+                long adapterDuration = session.adapter.durationMs();
                 if (adapterDuration > 0L) {
-                    durationMs = adapterDuration;
+                    session.durationMs = adapterDuration;
                 }
-                if (!readinessReported && adapter.isPlaybackReady()) {
-                    VideoNetwork.CHANNEL.sendToServer(
-                            new VideoReadyMessage(sessionId, durationMs));
-                    readinessReported = true;
-                    Main.LOGGER.debug("Reported completed video preload: session={}, duration={} ms",
-                            sessionId, durationMs);
+                if (!session.readinessReported && session.adapter.isPlaybackReady()) {
+                    VideoNetwork.CHANNEL.sendToServer(new VideoReadyMessage(
+                            session.sessionId, session.durationMs));
+                    session.readinessReported = true;
                 }
+                continue;
+            }
+            if (++session.ticksSinceReport < REPORT_INTERVAL_TICKS) {
+                continue;
+            }
+            long nowNanos = System.nanoTime();
+            if (session.lastReportNanos != 0L
+                    && nowNanos - session.lastReportNanos < REPORT_DEBOUNCE_NANOS) {
+                continue;
+            }
+            if (session.adapter.isPreparingSeek()) {
+                continue;
+            }
+            long adapterDuration = session.adapter.durationMs();
+            if (adapterDuration > 0L) {
+                session.durationMs = adapterDuration;
+            }
+            session.positionMs = clampToDuration(session, session.adapter.positionMs());
+            session.playing = session.adapter.isPlaying();
+            session.ticksSinceReport = 0;
+            session.lastReportNanos = nowNanos;
+            VideoNetwork.CHANNEL.sendToServer(new VideoProgressMessage(session.sessionId,
+                    session.positionMs, session.durationMs, session.playing));
+        }
+        updateProgressOverlay();
+    }
+
+    private static void updateSessionLoading(SessionState session) {
+        boolean loadRequired = playbackAvailable && session.initialized && shouldLoad(session);
+        if (!loadRequired) {
+            if (session.adapter != null) {
+                session.adapter.dispose();
+                session.adapter = null;
+                session.readinessReported = false;
+                session.clearPendingCorrection();
+                Main.LOGGER.debug("Unloaded distant video session: session={}",
+                        session.sessionId);
             }
             return;
         }
-        if (++ticksSinceReport < REPORT_INTERVAL_TICKS) {
+        if (session.adapter != null) {
             return;
         }
-        long nowNanos = System.nanoTime();
-        if (lastReportNanos != 0L
-                && nowNanos - lastReportNanos < REPORT_DEBOUNCE_NANOS) {
-            return;
+        session.adapter = new FfmpegPlaybackAdapter(session.sessionId);
+        session.adapter.open(session.videoId, session.videoUrl, session.audioUrl,
+                session.requestHeaders, session.cookie, session.disableScaling,
+                session.videoPipeLanes, session.videoPixelFormat, session.audioRange,
+                session.audioPlaybackMode, session.durationMs);
+        session.adapter.applyServerState(session.positionMs, session.playing,
+                session.waitingForClients, true);
+        session.adapter.setClientPaused(clientPaused);
+        session.readinessReported = false;
+        session.ticksSinceReport = REPORT_INTERVAL_TICKS;
+        session.lastReportNanos = 0L;
+        Main.LOGGER.debug("Loaded nearby video session: session={}", session.sessionId);
+    }
+
+    private static boolean shouldLoad(SessionState session) {
+        if (session.audioPlaybackMode != AudioPlaybackMode.POSITIONAL) {
+            return true;
         }
-        long currentPosition = positionMs;
-        boolean currentPlaying = playing;
-        long currentDuration = durationMs;
-        if (adapter != null) {
-            if (adapter.isPreparingSeek()) {
-                return;
-            }
-            currentDuration = adapter.durationMs();
-            if (currentDuration > 0L) {
-                durationMs = currentDuration;
-            }
-            currentPosition = clampToDuration(adapter.positionMs());
-            currentPlaying = adapter.isPlaying();
+        if (!ClientScreenTarget.hasReceivedTarget(session.sessionId)) {
+            return false;
         }
-        positionMs = currentPosition;
-        playing = currentPlaying;
-        ticksSinceReport = 0;
-        lastReportNanos = nowNanos;
-        VideoNetwork.CHANNEL.sendToServer(new VideoProgressMessage(
-                sessionId, currentPosition, currentDuration, currentPlaying));
+        ClientScreenTarget.SourcePosition source =
+                ClientScreenTarget.sourcePosition(session.sessionId);
+        if (source == null) {
+            return true;
+        }
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player == null || minecraft.level == null
+                || !source.dimension().equals(
+                minecraft.level.dimension().location().toString())) {
+            return false;
+        }
+        double range = session.audioRange
+                + (session.adapter == null ? 0.0D : LOAD_HYSTERESIS_BLOCKS);
+        return source.position().distanceToSqr(minecraft.player.getEyePosition())
+                < range * range;
     }
 
     public static void setClientPaused(boolean paused) {
@@ -304,45 +322,42 @@ public final class ClientVideoState {
         long nowNanos = System.nanoTime();
         if (paused) {
             clientPauseStartedNanos = nowNanos;
-            clientPauseSessionId = sessionId;
-        } else if (playbackAvailable && sessionId != null
-                && sessionId.equals(clientPauseSessionId)) {
+        } else if (playbackAvailable && clientPauseStartedNanos != 0L) {
             long pausedDurationMs = TimeUnit.NANOSECONDS.toMillis(
                     Math.max(0L, nowNanos - clientPauseStartedNanos));
-            VideoNetwork.CHANNEL.sendToServer(new VideoLocalPauseMessage(
-                    sessionId, ++clientPauseSequence, pausedDurationMs));
+            SESSIONS.keySet().forEach(sessionId ->
+                    VideoNetwork.CHANNEL.sendToServer(new VideoLocalPauseMessage(
+                            sessionId, ++clientPauseSequence, pausedDurationMs)));
+            clientPauseStartedNanos = 0L;
         }
         clientPaused = paused;
-        clientPauseStartedNanos = paused ? nowNanos : 0L;
-        clientPauseSessionId = paused ? sessionId : null;
-        if (adapter != null) {
-            adapter.setClientPaused(paused);
-        }
+        SESSIONS.values().forEach(session -> {
+            if (session.adapter != null) {
+                session.adapter.setClientPaused(paused);
+            }
+        });
     }
 
-    public static void onFrameRendered(long positionMs) {
-        if (adapter != null) {
-            adapter.onFrameRendered(positionMs);
+    public static void onFrameRendered(String sessionId, long positionMs) {
+        SessionState session = SESSIONS.get(sessionId);
+        if (session != null && session.adapter != null) {
+            session.adapter.onFrameRendered(positionMs);
         }
     }
 
     public static void requestResync() {
-        if (sessionId != null) {
-            VideoNetwork.CHANNEL.sendToServer(new VideoResyncMessage(sessionId));
-        }
+        SESSIONS.keySet().forEach(sessionId ->
+                VideoNetwork.CHANNEL.sendToServer(new VideoResyncMessage(sessionId)));
     }
 
-    public static void reportHttpError(int statusCode) {
-        if (sessionId != null) {
-            VideoNetwork.CHANNEL.sendToServer(
-                    new VideoHttpErrorMessage(sessionId, statusCode));
-        }
+    public static void reportPlaybackError(String sessionId,
+                                           VideoPlaybackErrorMessage.Reason reason,
+                                           int statusCode) {
+        VideoNetwork.CHANNEL.sendToServer(
+                new VideoPlaybackErrorMessage(sessionId, reason, statusCode));
     }
 
     public static void acceptTimeSync(VideoTimeSyncResponseMessage message) {
-        if (sessionId == null) {
-            return;
-        }
         long clientElapsedNanos = message.clientReceiveNanos() - message.clientSendNanos();
         long serverProcessingNanos = message.serverSendNanos() - message.serverReceiveNanos();
         long roundTripNanos = clientElapsedNanos - serverProcessingNanos;
@@ -364,43 +379,25 @@ public final class ClientVideoState {
         serverClockOffsetNanos = clientToServerOffset / 2L + serverToClientOffset / 2L;
         bestTimeSyncRoundTripNanos = roundTripNanos;
         serverClockSynchronized = true;
-        Main.LOGGER.debug("Updated video clock synchronization: roundTrip={} ms, offset={} ms",
-                TimeUnit.NANOSECONDS.toMillis(roundTripNanos),
-                TimeUnit.NANOSECONDS.toMillis(serverClockOffsetNanos));
     }
 
     public static void reset() {
-        Main.LOGGER.debug("Resetting client video state (session={})", sessionId);
-        if (adapter != null) {
-            adapter.close();
-        }
-        sessionId = null;
-        videoId = null;
-        videoUrl = null;
-        audioUrl = null;
-        requestHeaders = null;
-        cookie = null;
-        disableScaling = false;
-        videoPipeLanes = 0;
-        videoPixelFormat = VideoPixelFormat.RGB24;
-        durationMs = 0L;
-        positionMs = 0L;
-        playing = false;
-        waitingForClients = false;
-        readinessReported = false;
+        SESSIONS.values().forEach(session -> {
+            if (session.adapter != null) {
+                session.adapter.dispose();
+            }
+        });
+        SESSIONS.clear();
+        ClientScreenTarget.clear();
+        playbackNotice = null;
+        playbackNoticeExpiresNanos = 0L;
+        clearProgressOverlay();
         capabilityReported = false;
         availabilityNoticeShown = false;
         clientPaused = false;
         clientPauseStartedNanos = 0L;
         clientPauseSequence = 0L;
-        clientPauseSessionId = null;
-        revision = 0L;
-        ticksSinceReport = 0;
-        lastReportNanos = 0L;
         resetTimeSync();
-        clearPendingCorrection();
-        clearProgressOverlay();
-        ClientScreenTarget.clear();
     }
 
     private static void updateProgressOverlay() {
@@ -408,143 +405,96 @@ public final class ClientVideoState {
         if (minecraft.player == null) {
             return;
         }
+        if (playbackNotice != null) {
+            if (System.nanoTime() < playbackNoticeExpiresNanos) {
+                minecraft.gui.setOverlayMessage(playbackNotice, false);
+                progressOverlayVisible = true;
+                return;
+            }
+            playbackNotice = null;
+            playbackNoticeExpiresNanos = 0L;
+        }
+        if (SESSIONS.isEmpty()) {
+            clearProgressOverlay();
+            return;
+        }
+        SessionState session = nearestSession();
+        if (session == null) {
+            clearProgressOverlay();
+            return;
+        }
         if (!playbackAvailable) {
             String statusKey = playbackAvailabilityKnown
                     ? "overlay.video_synchronizer.ffmpeg_unavailable"
                     : "overlay.video_synchronizer.ffmpeg_checking";
-            ChatFormatting color = playbackAvailabilityKnown
-                    ? ChatFormatting.RED : ChatFormatting.YELLOW;
             minecraft.gui.setOverlayMessage(Component.translatable(statusKey)
-                    .withStyle(color, ChatFormatting.BOLD), false);
+                    .withStyle(playbackAvailabilityKnown ? ChatFormatting.RED : ChatFormatting.YELLOW,
+                            ChatFormatting.BOLD), false);
             progressOverlayVisible = true;
             return;
         }
-        if (adapter != null && adapter.isReconnecting()) {
-            Component overlay = Component.empty()
+        if (session.adapter != null && session.adapter.isReconnecting()) {
+            minecraft.gui.setOverlayMessage(Component.empty()
                     .append(Component.translatable("overlay.video_synchronizer.progress_reconnecting")
                             .withStyle(ChatFormatting.YELLOW, ChatFormatting.BOLD))
-                    .append(Component.literal(" -> ")
-                            .withStyle(ChatFormatting.DARK_GRAY, ChatFormatting.BOLD))
-                    .append(Component.literal(formatTime(clampToDuration(adapter.positionMs())))
-                            .withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD));
-            minecraft.gui.setOverlayMessage(overlay, false);
+                    .append(Component.literal(" -> "))
+                    .append(Component.literal(formatTime(session.adapter.positionMs()))
+                            .withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD)), false);
             progressOverlayVisible = true;
             return;
         }
-        if (System.nanoTime() < progressSwitchUntilNanos) {
-            Component overlay = Component.empty()
-                    .append(Component.translatable("overlay.video_synchronizer.progress_syncing")
-                            .withStyle(ChatFormatting.LIGHT_PURPLE, ChatFormatting.BOLD))
-                    .append(Component.literal("  "))
-                    .append(Component.literal(formatTime(progressSwitchFromMs))
-                            .withStyle(ChatFormatting.YELLOW, ChatFormatting.BOLD))
-                    .append(Component.literal(" -> ")
-                            .withStyle(ChatFormatting.DARK_GRAY, ChatFormatting.BOLD))
-                    .append(Component.literal(formatTime(progressSwitchToMs))
-                            .withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD));
-            minecraft.gui.setOverlayMessage(overlay, false);
-            progressOverlayVisible = true;
-            return;
-        }
-        progressSwitchUntilNanos = 0L;
-        long currentPosition = positionMs;
-        long currentDuration = durationMs;
-        boolean currentPlaying = playing;
-        if (adapter != null) {
-            currentPosition = clampToDuration(adapter.positionMs());
-            long adapterDuration = adapter.durationMs();
-            if (adapterDuration > 0L) {
-                currentDuration = adapterDuration;
-            }
-            currentPlaying = adapter.isPlaying();
-        }
-        ChatFormatting stateColor = waitingForClients ? ChatFormatting.LIGHT_PURPLE
+        long currentPosition = session.adapter == null
+                ? session.positionMs : session.adapter.positionMs();
+        long currentDuration = session.adapter == null
+                ? session.durationMs : session.adapter.durationMs();
+        boolean currentPlaying = session.adapter == null
+                ? session.playing : session.adapter.isPlaying();
+        ChatFormatting stateColor = session.waitingForClients ? ChatFormatting.LIGHT_PURPLE
                 : (currentPlaying ? ChatFormatting.GREEN : ChatFormatting.YELLOW);
-        Component overlay = Component.empty()
-                .append(Component.translatable(waitingForClients
+        minecraft.gui.setOverlayMessage(Component.empty()
+                .append(Component.translatable(session.waitingForClients
                                 ? "overlay.video_synchronizer.progress_buffering"
-                                : (currentPlaying
-                                ? "overlay.video_synchronizer.progress_playing"
+                                : (currentPlaying ? "overlay.video_synchronizer.progress_playing"
                                 : "overlay.video_synchronizer.progress_paused"))
                         .withStyle(stateColor, ChatFormatting.BOLD))
                 .append(Component.literal("  "))
-                .append(Component.literal(formatTime(currentPosition))
-                        .withStyle(ChatFormatting.AQUA, ChatFormatting.BOLD))
-                .append(Component.literal(" / ")
-                        .withStyle(ChatFormatting.DARK_GRAY, ChatFormatting.BOLD))
+                .append(Component.literal(formatTime(currentPosition)))
+                .append(Component.literal(" / "))
                 .append(Component.literal(currentDuration > 0L
-                                ? formatTime(currentDuration) : "--:--:--")
-                        .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD));
-        minecraft.gui.setOverlayMessage(overlay, false);
+                        ? formatTime(currentDuration) : "--:--:--")), false);
         progressOverlayVisible = true;
     }
 
-    private static void showProgressSwitch(long fromPositionMs, long toPositionMs) {
-        progressSwitchFromMs = fromPositionMs;
-        progressSwitchToMs = toPositionMs;
-        progressSwitchUntilNanos = System.nanoTime() + PROGRESS_SWITCH_DISPLAY_NANOS;
-    }
-
-    private static void clearProgressOverlay() {
-        progressSwitchUntilNanos = 0L;
-        if (!progressOverlayVisible) {
-            return;
-        }
-        Minecraft.getInstance().gui.setOverlayMessage(Component.empty(), false);
-        progressOverlayVisible = false;
-    }
-
-    private static boolean confirmRoutineCorrection(long serverPosition, long clientPosition,
-                                                     boolean driftRequiresSeek) {
-        if (!driftRequiresSeek) {
-            clearPendingCorrection();
-            return false;
-        }
-        long direction = Long.signum(serverPosition - clientPosition);
-        if (pendingCorrectionCount == 0 || direction != pendingCorrectionDirection) {
-            pendingCorrectionDirection = (int) direction;
-            pendingCorrectionCount = 1;
-            return false;
-        }
-        pendingCorrectionCount++;
-        if (pendingCorrectionCount < ROUTINE_CORRECTION_CONFIRMATIONS) {
-            return false;
-        }
-        clearPendingCorrection();
-        return true;
-    }
-
-    private static long compensatedServerPosition(long originalPositionMs, boolean isPlaying,
-                                                  boolean isWaitingForClients,
-                                                  long serverSentNanos,
-                                                  long clientReceivedNanos) {
-        long position = clampToDuration(originalPositionMs);
-        if (!isPlaying || isWaitingForClients || serverSentNanos == 0L) {
-            return position;
-        }
-        long nowNanos = System.nanoTime();
-        long elapsedNanos;
-        if (serverClockSynchronized) {
-            elapsedNanos = nowNanos + serverClockOffsetNanos - serverSentNanos;
-        } else {
-            long handlerDelayNanos = clientReceivedNanos == 0L
-                    ? 0L : Math.max(0L, nowNanos - clientReceivedNanos);
-            elapsedNanos = estimatedOneWayLatencyNanos() + handlerDelayNanos;
-        }
-        long boundedElapsedNanos = clamp(elapsedNanos, 0L, MAX_PACKET_AGE_NANOS);
-        return clampToDuration(position + TimeUnit.NANOSECONDS.toMillis(boundedElapsedNanos));
-    }
-
-    private static long estimatedOneWayLatencyNanos() {
+    private static SessionState nearestSession() {
         Minecraft minecraft = Minecraft.getInstance();
-        if (minecraft.player == null || minecraft.getConnection() == null) {
-            return 0L;
+        if (minecraft.player == null || minecraft.level == null) {
+            return SESSIONS.values().stream()
+                    .filter(ClientVideoState::isSessionRelevant).findFirst().orElse(null);
         }
-        var playerInfo = minecraft.getConnection().getPlayerInfo(minecraft.player.getUUID());
-        if (playerInfo == null) {
-            return 0L;
+        String dimension = minecraft.level.dimension().location().toString();
+        SessionState nearest = null;
+        double nearestDistance = Double.MAX_VALUE;
+        for (SessionState session : SESSIONS.values()) {
+            if (!isSessionRelevant(session)) {
+                continue;
+            }
+            ClientScreenTarget.SourcePosition source =
+                    ClientScreenTarget.sourcePosition(session.sessionId);
+            if (source == null || !dimension.equals(source.dimension())) {
+                continue;
+            }
+            double distance = source.position().distanceToSqr(minecraft.player.position());
+            if (distance < nearestDistance) {
+                nearest = session;
+                nearestDistance = distance;
+            }
         }
-        return TimeUnit.MILLISECONDS.toNanos(Math.max(0, playerInfo.getLatency()) / 2L);
+        return nearest != null ? nearest : SESSIONS.values().stream()
+                .filter(ClientVideoState::isSessionRelevant).findFirst().orElse(null);
+    }
+
+    private static boolean isSessionRelevant(SessionState session) {
+        return session.adapter != null || shouldLoad(session);
     }
 
     private static void maybeRequestTimeSync() {
@@ -565,11 +515,8 @@ public final class ClientVideoState {
         if (minecraft.player == null || minecraft.getConnection() == null) {
             return;
         }
-        VideoNetwork.CHANNEL.sendToServer(
-                new VideoClientCapabilityMessage(playbackAvailable));
+        VideoNetwork.CHANNEL.sendToServer(new VideoClientCapabilityMessage(playbackAvailable));
         capabilityReported = true;
-        Main.LOGGER.debug("Reported client video playback capability: available={}",
-                playbackAvailable);
     }
 
     private static void maybeShowPlaybackUnavailableNotice() {
@@ -585,6 +532,36 @@ public final class ClientVideoState {
         availabilityNoticeShown = true;
     }
 
+    private static long compensatedServerPosition(long originalPositionMs, boolean isPlaying,
+                                                  boolean waitingForClients,
+                                                  long serverSentNanos, long clientReceivedNanos) {
+        long position = Math.max(0L, originalPositionMs);
+        if (!isPlaying || waitingForClients || serverSentNanos == 0L) {
+            return position;
+        }
+        long nowNanos = System.nanoTime();
+        long elapsedNanos;
+        if (serverClockSynchronized) {
+            elapsedNanos = nowNanos + serverClockOffsetNanos - serverSentNanos;
+        } else {
+            long handlerDelayNanos = clientReceivedNanos == 0L
+                    ? 0L : Math.max(0L, nowNanos - clientReceivedNanos);
+            elapsedNanos = estimatedOneWayLatencyNanos() + handlerDelayNanos;
+        }
+        return position + TimeUnit.NANOSECONDS.toMillis(
+                Math.max(0L, Math.min(MAX_PACKET_AGE_NANOS, elapsedNanos)));
+    }
+
+    private static long estimatedOneWayLatencyNanos() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player == null || minecraft.getConnection() == null) {
+            return 0L;
+        }
+        var playerInfo = minecraft.getConnection().getPlayerInfo(minecraft.player.getUUID());
+        return playerInfo == null ? 0L
+                : TimeUnit.MILLISECONDS.toNanos(Math.max(0, playerInfo.getLatency()) / 2L);
+    }
+
     private static void resetTimeSync() {
         lastTimeSyncRequestNanos = 0L;
         timeSyncWindowStartedNanos = 0L;
@@ -593,35 +570,89 @@ public final class ClientVideoState {
         serverClockSynchronized = false;
     }
 
-    private static void clearPendingCorrection() {
-        pendingCorrectionDirection = 0;
-        pendingCorrectionCount = 0;
+    private static void clearProgressOverlay() {
+        if (progressOverlayVisible) {
+            Minecraft.getInstance().gui.setOverlayMessage(Component.empty(), false);
+        }
+        progressOverlayVisible = false;
     }
 
     private static String formatTime(long milliseconds) {
-        long totalSeconds = Math.max(0L, milliseconds) / 1000L;
-        long hours = totalSeconds / 3600L;
-        long minutes = totalSeconds % 3600L / 60L;
-        long seconds = totalSeconds % 60L;
-        return String.format(Locale.ROOT, "%02d:%02d:%02d", hours, minutes, seconds);
+        long totalSeconds = Math.max(0L, milliseconds) / 1_000L;
+        return String.format(Locale.ROOT, "%02d:%02d:%02d", totalSeconds / 3_600L,
+                totalSeconds % 3_600L / 60L, totalSeconds % 60L);
     }
 
-    private static long clamp(long value, long min, long max) {
-        return Math.max(min, Math.min(max, value));
+    private static long clampToDuration(SessionState session, long value) {
+        return session.durationMs > 0L
+                ? Math.max(0L, Math.min(session.durationMs, value)) : Math.max(0L, value);
     }
 
-    private static long clampToDuration(long value) {
-        return durationMs > 0L ? clamp(value, 0L, durationMs) : Math.max(0L, value);
+    private static final class SessionState {
+        private final String sessionId;
+        private String videoId;
+        private String videoUrl;
+        private String audioUrl;
+        private String requestHeaders;
+        private String cookie;
+        private boolean disableScaling;
+        private int videoPipeLanes;
+        private VideoPixelFormat videoPixelFormat = VideoPixelFormat.RGB24;
+        private double audioRange = 48.0D;
+        private AudioPlaybackMode audioPlaybackMode = AudioPlaybackMode.POSITIONAL;
+        private long durationMs;
+        private long positionMs;
+        private boolean playing;
+        private boolean waitingForClients;
+        private boolean readinessReported;
+        private long revision;
+        private int ticksSinceReport;
+        private long lastReportNanos;
+        private boolean initialized;
+        private int pendingCorrectionDirection;
+        private int pendingCorrectionCount;
+        private long progressSwitchUntilNanos;
+        private PlaybackAdapter adapter;
+
+        private SessionState(String sessionId) {
+            this.sessionId = sessionId;
+        }
+
+        private void clearPendingCorrection() {
+            pendingCorrectionDirection = 0;
+            pendingCorrectionCount = 0;
+        }
+
+        private boolean confirmRoutineCorrection(long serverPosition, long clientPosition,
+                                                  boolean driftRequiresSeek) {
+            if (!driftRequiresSeek) {
+                clearPendingCorrection();
+                return false;
+            }
+            int direction = Long.signum(serverPosition - clientPosition);
+            if (pendingCorrectionCount == 0 || direction != pendingCorrectionDirection) {
+                pendingCorrectionDirection = direction;
+                pendingCorrectionCount = 1;
+                return false;
+            }
+            pendingCorrectionCount++;
+            if (pendingCorrectionCount < ROUTINE_CORRECTION_CONFIRMATIONS) {
+                return false;
+            }
+            clearPendingCorrection();
+            return true;
+        }
+
+        private void showProgressSwitch(long from, long to) {
+            progressSwitchUntilNanos = System.nanoTime() + PROGRESS_SWITCH_DISPLAY_NANOS;
+        }
     }
 
-    /**
-     * Implement this interface in the actual VLC/JavaFX/etc. player integration.
-     * All callbacks run on the Minecraft client thread.
-     */
     public interface PlaybackAdapter {
         void open(String videoId, String videoUrl, String audioUrl, String requestHeaders,
                   String cookie, boolean disableScaling, int videoPipeLanes,
-                  VideoPixelFormat videoPixelFormat, long durationMs);
+                  VideoPixelFormat videoPixelFormat, double audioRange,
+                  AudioPlaybackMode audioPlaybackMode, long durationMs);
 
         void applyServerState(long positionMs, boolean playing, boolean waitingForClients,
                               boolean hardSeek);
@@ -632,11 +663,9 @@ public final class ClientVideoState {
 
         boolean isPlaying();
 
-        /** Local Minecraft pause state; this must not be reported as a server pause intent. */
         default void setClientPaused(boolean paused) {
         }
 
-        /** Called on the render thread after a decoded frame has been uploaded. */
         default void onFrameRendered(long positionMs) {
         }
 
@@ -648,7 +677,6 @@ public final class ClientVideoState {
             return isPlaybackClockStarted();
         }
 
-        /** True while an old stream remains visible during a prepared hard seek. */
         default boolean isPreparingSeek() {
             return false;
         }
@@ -657,8 +685,11 @@ public final class ClientVideoState {
             return false;
         }
 
-        /** Performs non-blocking playback health checks on the client thread. */
         default void clientTick() {
+        }
+
+        default void dispose() {
+            close();
         }
 
         void close();

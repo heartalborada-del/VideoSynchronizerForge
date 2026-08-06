@@ -7,7 +7,7 @@ import net.minecraftforge.network.NetworkEvent;
 import net.minecraftforge.network.PacketDistributor;
 import org.arkcraft.video_synchronizer.block.VideoManagerBlockEntity;
 import org.arkcraft.video_synchronizer.client.gui.VideoManagerScreen;
-import org.arkcraft.video_synchronizer.server.ServerVideoSession;
+import org.arkcraft.video_synchronizer.server.ServerVideoSessionManager;
 
 import java.util.function.Supplier;
 
@@ -15,6 +15,7 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
                                       String audioUrl, String requestHeaders, String cookie,
                                       boolean disableScaling, int videoPipeLanes,
                                       VideoPixelFormat videoPixelFormat,
+                                      double audioRange, AudioPlaybackMode audioPlaybackMode,
                                       boolean active, long positionMs, long durationMs, boolean playing,
                                       boolean waitingForClients) {
     public void encode(FriendlyByteBuf buf) {
@@ -27,6 +28,8 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
         buf.writeBoolean(disableScaling);
         buf.writeVarInt(videoPipeLanes);
         buf.writeEnum(videoPixelFormat);
+        buf.writeDouble(audioRange);
+        buf.writeEnum(audioPlaybackMode);
         buf.writeBoolean(active);
         buf.writeLong(positionMs);
         buf.writeLong(durationMs);
@@ -41,6 +44,8 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
                 buf.readUtf(MediaRequestOptions.MAX_COOKIE_LENGTH), buf.readBoolean(),
                 buf.readVarInt(),
                 buf.readEnum(VideoPixelFormat.class),
+                buf.readDouble(),
+                buf.readEnum(AudioPlaybackMode.class),
                 buf.readBoolean(),
                 buf.readLong(), buf.readLong(), buf.readBoolean(), buf.readBoolean());
     }
@@ -52,7 +57,8 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
 
     public static void send(ServerPlayer player, BlockPos pos,
                             VideoManagerBlockEntity manager) {
-        ServerVideoSession.ControlState state = ServerVideoSession.controlState(manager.getScreenId());
+        ServerVideoSessionManager.ControlState state =
+                ServerVideoSessionManager.controlState(manager.getScreenId());
         String videoUrl = state.active() ? state.videoUrl() : manager.getVideoUrl();
         String audioUrl = state.active() ? state.audioUrl() : manager.getAudioUrl();
         String requestHeaders = state.active()
@@ -64,9 +70,13 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
                 ? state.videoPipeLanes() : manager.getVideoPipeLanes();
         VideoPixelFormat videoPixelFormat = state.active()
                 ? state.videoPixelFormat() : manager.getVideoPixelFormat();
+        double audioRange = state.active() ? state.audioRange() : manager.getAudioRange();
+        AudioPlaybackMode audioPlaybackMode = state.active()
+                ? state.audioPlaybackMode() : manager.getAudioPlaybackMode();
         VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
                 new OpenVideoManagerMessage(pos, manager.getScreenId(), videoUrl, audioUrl,
                         requestHeaders, cookie, disableScaling, videoPipeLanes, videoPixelFormat,
+                        audioRange, audioPlaybackMode,
                         state.active(), state.positionMs(), state.durationMs(), state.playing(),
                         state.waitingForClients()));
     }

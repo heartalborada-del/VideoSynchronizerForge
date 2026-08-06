@@ -6,7 +6,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraftforge.network.NetworkEvent;
 import org.arkcraft.video_synchronizer.block.VideoManagerBlockEntity;
 import org.arkcraft.video_synchronizer.server.ServerScreenRegistry;
-import org.arkcraft.video_synchronizer.server.ServerVideoSession;
+import org.arkcraft.video_synchronizer.server.ServerVideoSessionManager;
 
 import java.util.function.Supplier;
 
@@ -14,6 +14,7 @@ public record VideoManagerActionMessage(BlockPos pos, Action action, String scre
                                          String videoUrl, String audioUrl, String requestHeaders,
                                          String cookie, boolean disableScaling,
                                          int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                                         double audioRange, AudioPlaybackMode audioPlaybackMode,
                                          long positionMs) {
     public void encode(FriendlyByteBuf buf) {
         buf.writeBlockPos(pos);
@@ -26,6 +27,8 @@ public record VideoManagerActionMessage(BlockPos pos, Action action, String scre
         buf.writeBoolean(disableScaling);
         buf.writeVarInt(videoPipeLanes);
         buf.writeEnum(videoPixelFormat);
+        buf.writeDouble(audioRange);
+        buf.writeEnum(audioPlaybackMode);
         buf.writeLong(positionMs);
     }
 
@@ -36,6 +39,8 @@ public record VideoManagerActionMessage(BlockPos pos, Action action, String scre
                 buf.readUtf(MediaRequestOptions.MAX_COOKIE_LENGTH), buf.readBoolean(),
                 buf.readVarInt(),
                 buf.readEnum(VideoPixelFormat.class),
+                buf.readDouble(),
+                buf.readEnum(AudioPlaybackMode.class),
                 buf.readLong());
     }
 
@@ -53,18 +58,20 @@ public record VideoManagerActionMessage(BlockPos pos, Action action, String scre
                 case SAVE -> saveConfiguration(sender, manager, message.screenId(),
                         message.videoUrl(), message.audioUrl(), message.requestHeaders(),
                         message.cookie(), message.disableScaling(), message.videoPipeLanes(),
-                        message.videoPixelFormat());
+                        message.videoPixelFormat(), message.audioRange(),
+                        message.audioPlaybackMode());
                 case START -> start(sender, manager, message.screenId(),
                         message.videoUrl(), message.audioUrl(), message.requestHeaders(),
                         message.cookie(), message.disableScaling(), message.videoPipeLanes(),
-                        message.videoPixelFormat());
-                case PAUSE -> ServerVideoSession.setPlayingForScreen(
+                        message.videoPixelFormat(), message.audioRange(),
+                        message.audioPlaybackMode());
+                case PAUSE -> ServerVideoSessionManager.setPlayingForScreen(
                         sender.getServer(), manager.getScreenId(), false);
-                case RESUME -> ServerVideoSession.setPlayingForScreen(
+                case RESUME -> ServerVideoSessionManager.setPlayingForScreen(
                         sender.getServer(), manager.getScreenId(), true);
-                case SEEK -> ServerVideoSession.seekForScreen(
+                case SEEK -> ServerVideoSessionManager.seekForScreen(
                         sender.getServer(), manager.getScreenId(), message.positionMs());
-                case STOP -> ServerVideoSession.stopForScreen(manager.getScreenId());
+                case STOP -> ServerVideoSessionManager.stopForScreen(manager.getScreenId());
             }
         } catch (IllegalArgumentException exception) {
             sender.sendSystemMessage(Component.literal(exception.getMessage()));
@@ -78,22 +85,25 @@ public record VideoManagerActionMessage(BlockPos pos, Action action, String scre
                                            String requestedAudioUrl, String requestedHeaders,
                                            String requestedCookie,
                                            boolean disableScaling, int requestedVideoPipeLanes,
-                                           VideoPixelFormat videoPixelFormat) {
+                                           VideoPixelFormat videoPixelFormat,
+                                           double requestedAudioRange,
+                                           AudioPlaybackMode audioPlaybackMode) {
         String screenId = ServerScreenRegistry.normalizeId(requestedScreenId);
         ServerScreenRegistry.require(sender.getServer(), screenId);
         String videoUrl = requestedVideoUrl.trim();
         String audioUrl = requestedAudioUrl.trim();
         if (!videoUrl.isBlank()) {
-            ServerVideoSession.validateMediaUrl(videoUrl);
+            ServerVideoSessionManager.validateMediaUrl(videoUrl);
         }
         if (!audioUrl.isBlank()) {
-            ServerVideoSession.validateMediaUrl(audioUrl);
+            ServerVideoSessionManager.validateMediaUrl(audioUrl);
         }
         MediaRequestOptions options = new MediaRequestOptions(requestedHeaders, requestedCookie);
         int videoPipeLanes = normalizeVideoPipeLanes(requestedVideoPipeLanes);
+        double audioRange = ServerVideoSessionManager.validateAudioRange(requestedAudioRange);
         manager.setConfiguration(screenId, videoUrl, audioUrl,
                 options.headers(), options.cookie(), disableScaling, videoPipeLanes,
-                videoPixelFormat);
+                videoPixelFormat, audioRange, audioPlaybackMode);
     }
 
     private static void start(net.minecraft.server.level.ServerPlayer sender,
@@ -102,18 +112,21 @@ public record VideoManagerActionMessage(BlockPos pos, Action action, String scre
                                String requestedAudioUrl, String requestedHeaders,
                                String requestedCookie, boolean disableScaling,
                                int requestedVideoPipeLanes,
-                               VideoPixelFormat videoPixelFormat) {
+                               VideoPixelFormat videoPixelFormat,
+                               double requestedAudioRange,
+                               AudioPlaybackMode audioPlaybackMode) {
         String screenId = ServerScreenRegistry.normalizeId(requestedScreenId);
         String videoUrl = requestedVideoUrl.trim();
         String audioUrl = requestedAudioUrl.trim();
         MediaRequestOptions options = new MediaRequestOptions(requestedHeaders, requestedCookie);
         int videoPipeLanes = normalizeVideoPipeLanes(requestedVideoPipeLanes);
-        ServerVideoSession.startForScreen(sender.getServer(), screenId, videoUrl, audioUrl,
+        double audioRange = ServerVideoSessionManager.validateAudioRange(requestedAudioRange);
+        ServerVideoSessionManager.startForScreen(sender.getServer(), screenId, videoUrl, audioUrl,
                 options.headers(), options.cookie(), disableScaling, videoPipeLanes,
-                videoPixelFormat);
+                videoPixelFormat, audioRange, audioPlaybackMode);
         manager.setConfiguration(screenId, videoUrl, audioUrl,
                 options.headers(), options.cookie(), disableScaling, videoPipeLanes,
-                videoPixelFormat);
+                videoPixelFormat, audioRange, audioPlaybackMode);
     }
 
     private static int normalizeVideoPipeLanes(int lanes) {

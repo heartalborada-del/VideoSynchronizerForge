@@ -8,8 +8,6 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** Keeps the newest submitted frame and reuses its backing arrays. */
 public final class VideoFrameBuffer {
-    public static final VideoFrameBuffer INSTANCE = new VideoFrameBuffer();
-
     private final AtomicReference<DecodedFrame> pending = new AtomicReference<>();
     private final ConcurrentLinkedQueue<byte[]> pool = new ConcurrentLinkedQueue<>();
     private final AtomicLong allocatedArrays = new AtomicLong();
@@ -21,7 +19,7 @@ public final class VideoFrameBuffer {
     private final AtomicLong discardedArrays = new AtomicLong();
     private final AtomicLong clearedFrames = new AtomicLong();
 
-    private VideoFrameBuffer() {
+    public VideoFrameBuffer() {
     }
 
     public byte[] acquire(int size) {

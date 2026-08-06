@@ -2,6 +2,7 @@ package org.arkcraft.video_synchronizer.server;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ClipContext;
@@ -71,5 +72,77 @@ public final class ScreenCreator {
             level.setBlock(pos, screen, Block.UPDATE_CLIENTS);
         }
         return center;
+    }
+
+    public static BlockPos createSelection(ServerPlayer player, BlockPos first, BlockPos second,
+                                           Direction facing, Direction screenUp,
+                                           String dimension, Direction secondFacing) {
+        ServerLevel level = player.serverLevel();
+        if (!level.dimension().location().toString().equals(dimension)) {
+            throw new SelectionException("message.video_synchronizer.selection_tool.dimension");
+        }
+        if (facing != secondFacing) {
+            throw new SelectionException("message.video_synchronizer.selection_tool.face");
+        }
+        ScreenOrientation orientation = ScreenOrientation.of(facing, screenUp);
+        int dx = second.getX() - first.getX();
+        int dy = second.getY() - first.getY();
+        int dz = second.getZ() - first.getZ();
+        if (dot(dx, dy, dz, facing) != 0) {
+            throw new SelectionException("message.video_synchronizer.selection_tool.plane");
+        }
+        int columnOffset = dot(dx, dy, dz, orientation.right());
+        int rowOffset = dot(dx, dy, dz, orientation.up());
+        int width = Math.abs(columnOffset) + 1;
+        int height = Math.abs(rowOffset) + 1;
+        if (width > ScreenLayout.MAX_DIMENSION || height > ScreenLayout.MAX_DIMENSION) {
+            throw new SelectionException("message.video_synchronizer.selection_tool.size",
+                    ScreenLayout.MAX_DIMENSION);
+        }
+
+        BlockPos origin = first.relative(orientation.right(), Math.min(0, columnOffset))
+                .relative(orientation.up(), Math.min(0, rowOffset)).immutable();
+        List<BlockPos> positions = new ArrayList<>(width * height);
+        for (int row = 0; row < height; row++) {
+            for (int column = 0; column < width; column++) {
+                BlockPos pos = origin.relative(orientation.right(), column)
+                        .relative(orientation.up(), row);
+                if (!Level.isInSpawnableBounds(pos) || !level.hasChunkAt(pos)) {
+                    throw new SelectionException(
+                            "message.video_synchronizer.selection_tool.unloaded");
+                }
+                if (!level.getBlockState(pos).canBeReplaced()) {
+                    throw new SelectionException(
+                            "message.video_synchronizer.selection_tool.obstructed",
+                            pos.toShortString());
+                }
+                positions.add(pos.immutable());
+            }
+        }
+
+        BlockState screen = Main.SCREEN_BLOCK.get().defaultBlockState()
+                .setValue(ScreenBlock.FACING, facing)
+                .setValue(ScreenBlock.SCREEN_UP, screenUp);
+        positions.forEach(pos -> level.setBlock(pos, screen, Block.UPDATE_CLIENTS));
+        return second;
+    }
+
+    private static int dot(int dx, int dy, int dz, Direction direction) {
+        return dx * direction.getStepX() + dy * direction.getStepY()
+                + dz * direction.getStepZ();
+    }
+
+    public static final class SelectionException extends IllegalArgumentException {
+        private final String translationKey;
+        private final Object[] arguments;
+
+        private SelectionException(String translationKey, Object... arguments) {
+            this.translationKey = translationKey;
+            this.arguments = arguments;
+        }
+
+        public Component component() {
+            return Component.translatable(translationKey, arguments);
+        }
     }
 }

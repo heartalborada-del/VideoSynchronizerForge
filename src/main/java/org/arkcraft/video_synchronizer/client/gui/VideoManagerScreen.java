@@ -9,6 +9,7 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import org.arkcraft.video_synchronizer.network.OpenVideoManagerMessage;
+import org.arkcraft.video_synchronizer.network.AudioPlaybackMode;
 import org.arkcraft.video_synchronizer.network.MediaRequestOptions;
 import org.arkcraft.video_synchronizer.network.VideoManagerActionMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
@@ -27,6 +28,8 @@ public final class VideoManagerScreen extends Screen {
     private boolean disableScaling;
     private int videoPipeLanes;
     private VideoPixelFormat videoPixelFormat;
+    private double audioRange;
+    private AudioPlaybackMode audioPlaybackMode;
     private boolean active;
     private boolean playing;
     private boolean waitingForClients;
@@ -38,6 +41,8 @@ public final class VideoManagerScreen extends Screen {
     private EditBox videoUrlInput;
     private EditBox audioUrlInput;
     private EditBox positionInput;
+    private EditBox audioRangeInput;
+    private Button audioModeButton;
     private Button streamModeButton;
     private Button scalingButton;
     private Button pipeLanesButton;
@@ -66,10 +71,11 @@ public final class VideoManagerScreen extends Screen {
         }
     }
 
-    public static void acceptPlaybackState(long positionMs, long durationMs,
+    public static void acceptPlaybackState(String screenId, long positionMs, long durationMs,
                                            boolean playing, boolean waitingForClients) {
         Minecraft minecraft = Minecraft.getInstance();
-        if (minecraft.screen instanceof VideoManagerScreen screen && screen.active) {
+        if (minecraft.screen instanceof VideoManagerScreen screen && screen.active
+                && screen.screenId.equals(screenId)) {
             screen.positionMs = positionMs;
             if (durationMs > 0L) {
                 screen.durationMs = durationMs;
@@ -84,9 +90,10 @@ public final class VideoManagerScreen extends Screen {
         }
     }
 
-    public static void acceptStop() {
+    public static void acceptStop(String screenId) {
         Minecraft minecraft = Minecraft.getInstance();
-        if (minecraft.screen instanceof VideoManagerScreen screen && screen.active) {
+        if (minecraft.screen instanceof VideoManagerScreen screen && screen.active
+                && screen.screenId.equals(screenId)) {
             screen.active = false;
             screen.playing = false;
             screen.waitingForClients = false;
@@ -157,9 +164,13 @@ public final class VideoManagerScreen extends Screen {
                 }).bounds(formLeft + (optionButtonWidth + 4) * 4, formTop + 116,
                         optionButtonWidth, 20).build());
 
-        int seekButtonWidth = 72;
+        int audioRangeWidth = 64;
+        int audioModeWidth = 68;
+        int rowGap = 4;
+        int positionSectionWidth = formWidth - audioRangeWidth - audioModeWidth - rowGap * 2;
+        int seekButtonWidth = 60;
         positionInput = new EditBox(font, formLeft, formTop + 165,
-                formWidth - seekButtonWidth - 4, 20,
+                positionSectionWidth - seekButtonWidth - rowGap, 20,
                 Component.translatable("gui.video_synchronizer.manager.position"));
         positionInput.setMaxLength(12);
         positionInput.setFilter(value -> value.matches("[0-9:]*"));
@@ -169,8 +180,25 @@ public final class VideoManagerScreen extends Screen {
         seekButton = addRenderableWidget(Button.builder(
                 Component.translatable("gui.video_synchronizer.manager.seek"),
                 button -> send(VideoManagerActionMessage.Action.SEEK))
-                .bounds(formLeft + formWidth - seekButtonWidth, formTop + 165,
+                .bounds(formLeft + positionSectionWidth - seekButtonWidth, formTop + 165,
                         seekButtonWidth, 20).build());
+
+        audioRangeInput = new EditBox(font,
+                formLeft + positionSectionWidth + rowGap, formTop + 165,
+                audioRangeWidth, 20,
+                Component.translatable("gui.video_synchronizer.manager.audio_range"));
+        audioRangeInput.setMaxLength(6);
+        audioRangeInput.setFilter(value -> value.matches("[0-9.]*"));
+        audioRangeInput.setValue(formatAudioRange(audioRange));
+        audioRangeInput.setTooltip(Tooltip.create(Component.translatable(
+                "gui.video_synchronizer.manager.audio_range_tooltip")));
+        addRenderableWidget(audioRangeInput);
+
+        audioModeButton = addRenderableWidget(Button.builder(Component.empty(), button -> {
+                    audioPlaybackMode = audioPlaybackMode.next();
+                    updateAudioModeButton();
+                }).bounds(audioRangeInput.getX() + audioRangeWidth + rowGap,
+                        formTop + 165, audioModeWidth, 20).build());
 
         int halfWidth = (formWidth - 4) / 2;
         addRenderableWidget(Button.builder(
@@ -200,6 +228,7 @@ public final class VideoManagerScreen extends Screen {
         updateScalingButton();
         updatePipeLanesButton();
         updatePixelFormatButton();
+        updateAudioModeButton();
         updateButtonState();
     }
 
@@ -241,6 +270,12 @@ public final class VideoManagerScreen extends Screen {
         graphics.drawString(font,
                 Component.translatable("gui.video_synchronizer.manager.position"),
                 formLeft, formTop + 154, 0xA0A0A0);
+        graphics.drawString(font,
+                Component.translatable("gui.video_synchronizer.manager.audio_range"),
+                audioRangeInput.getX(), formTop + 154, 0xA0A0A0);
+        graphics.drawString(font,
+                Component.translatable("gui.video_synchronizer.manager.audio_mode"),
+                audioModeButton.getX(), formTop + 154, 0xA0A0A0);
         super.render(graphics, mouseX, mouseY, partialTick);
     }
 
@@ -253,6 +288,8 @@ public final class VideoManagerScreen extends Screen {
         disableScaling = message.disableScaling();
         videoPipeLanes = normalizeVideoPipeLanes(message.videoPipeLanes());
         videoPixelFormat = message.videoPixelFormat();
+        audioRange = message.audioRange();
+        audioPlaybackMode = message.audioPlaybackMode();
         splitStreams = !audioUrl.isBlank();
         active = message.active();
         playing = message.playing();
@@ -265,10 +302,12 @@ public final class VideoManagerScreen extends Screen {
             videoUrlInput.setValue(videoUrl);
             audioUrlInput.setValue(audioUrl);
             positionInput.setValue(formatTime(positionMs));
+            audioRangeInput.setValue(formatAudioRange(audioRange));
             updateStreamModeControls();
             updateScalingButton();
             updatePipeLanesButton();
             updatePixelFormatButton();
+            updateAudioModeButton();
             updateButtonState();
         }
     }
@@ -282,10 +321,26 @@ public final class VideoManagerScreen extends Screen {
                 return;
             }
         }
+        double requestedAudioRange = audioRange;
+        if (action == VideoManagerActionMessage.Action.SAVE
+                || action == VideoManagerActionMessage.Action.START) {
+            if (audioPlaybackMode == AudioPlaybackMode.GLOBAL) {
+                audioRangeInput.setTextColor(0xE0E0E0);
+            } else {
+                try {
+                    requestedAudioRange = parseAudioRange(audioRangeInput.getValue());
+                    audioRangeInput.setTextColor(0xE0E0E0);
+                } catch (NumberFormatException exception) {
+                    audioRangeInput.setTextColor(0xFF5555);
+                    return;
+                }
+            }
+        }
         VideoNetwork.CHANNEL.sendToServer(new VideoManagerActionMessage(
                 managerPos, action, screenIdInput.getValue(), videoUrlInput.getValue(),
                 splitStreams ? audioUrlInput.getValue() : "", requestHeaders, cookie,
                 disableScaling, videoPipeLanes, videoPixelFormat,
+                requestedAudioRange, audioPlaybackMode,
                 requestedPosition));
     }
 
@@ -311,6 +366,11 @@ public final class VideoManagerScreen extends Screen {
         screenId = screenIdInput.getValue();
         videoUrl = videoUrlInput.getValue();
         audioUrl = audioUrlInput.getValue();
+        try {
+            audioRange = parseAudioRange(audioRangeInput.getValue());
+        } catch (NumberFormatException ignored) {
+            // Keep the last valid value while an editor screen is open.
+        }
     }
 
     private void updateStreamModeControls() {
@@ -359,6 +419,22 @@ public final class VideoManagerScreen extends Screen {
         pixelFormatButton.setMessage(Component.literal(videoPixelFormat.name()));
         pixelFormatButton.setTooltip(Tooltip.create(Component.translatable(
                 "gui.video_synchronizer.manager.pixel_format_tooltip")));
+    }
+
+    private void updateAudioModeButton() {
+        if (audioModeButton == null || audioRangeInput == null) {
+            return;
+        }
+        String suffix = switch (audioPlaybackMode) {
+            case POSITIONAL -> "positional";
+            case FIXED_RANGE -> "fixed_range";
+            case GLOBAL -> "global";
+        };
+        audioModeButton.setMessage(Component.translatable(
+                "gui.video_synchronizer.manager.audio_mode_" + suffix + "_short"));
+        audioModeButton.setTooltip(Tooltip.create(Component.translatable(
+                "gui.video_synchronizer.manager.audio_mode_" + suffix)));
+        audioRangeInput.active = audioPlaybackMode != AudioPlaybackMode.GLOBAL;
     }
 
     private static int nextVideoPipeLanes(int lanes) {
@@ -419,6 +495,19 @@ public final class VideoManagerScreen extends Screen {
         long totalSeconds = Math.addExact(Math.multiplyExact(hours, 3_600L),
                 Math.addExact(Math.multiplyExact(minutes, 60L), seconds));
         return Math.multiplyExact(totalSeconds, 1_000L);
+    }
+
+    private static double parseAudioRange(String value) {
+        double range = Double.parseDouble(value);
+        if (!Double.isFinite(range) || range < 1.0D || range > 1024.0D) {
+            throw new NumberFormatException("Audio range must be between 1 and 1024");
+        }
+        return range;
+    }
+
+    private static String formatAudioRange(double value) {
+        return value == Math.rint(value)
+                ? Long.toString(Math.round(value)) : Double.toString(value);
     }
 
     @Override

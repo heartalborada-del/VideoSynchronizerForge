@@ -7,15 +7,20 @@
 > Synchronized online video playback on continuous multi-block screens for Minecraft
 > Forge 1.20.1.
 
-Video Synchronizer lets a Minecraft server control one shared playback session while
-every player decodes the media locally with FFmpeg. This keeps video traffic and decoding
-work away from the server while preserving synchronized playback across all clients.
+Video Synchronizer lets each screen run an independent server-controlled playback session
+while every player decodes the media locally with FFmpeg. This keeps video traffic and
+decoding work away from the server while preserving synchronized playback across clients.
 
 ## Highlights
 
 - Server-authoritative play, pause, seek, stop, reconnect, and late-join synchronization
-- Continuous video walls, floors, and ceilings up to 256 × 256 blocks
+- Continuous video walls, floors, and ceilings up to 1024 x 1024 blocks
+- Simultaneous independent playback on multiple screens
+- Per-manager positional, fixed-range, or full-volume server-wide audio
+- Positional sessions unload FFmpeg and media resources for out-of-range clients
+- Two-corner Screen Selection Tool for creating wall, floor, and ceiling displays
 - HTTP(S) MP4, HLS, and split DASH video/audio sources
+- Clear player errors when a URL is not direct playable media or lacks its configured track
 - In-world Video Manager GUI and `/video` commands
 - Automatic resolution and frame-rate limiting for high-resolution sources
 - Hardware decoding with automatic software fallback
@@ -58,6 +63,7 @@ a screen to bind its ID to a Video Manager. Playback controls require permission
 - Media URLs and authentication options are sent to connected clients because decoding
   happens locally. Do not use credentials that players must not receive.
 - Live streams without a known duration cannot use automatic end-of-playback stopping.
+- `/video stop` stops every active session; a Video Manager stops only its own screen.
 - The embedded FFmpeg packages use LGPL shared builds and include the corresponding
   license and source notices.
 
@@ -75,14 +81,19 @@ Video Synchronizer is MIT licensed. Bundled FFmpeg distributions remain under LG
 
 > 为 Minecraft Forge 1.20.1 提供多方块连续屏幕与在线音视频同步播放。
 
-Video Synchronizer 由服务端维护统一的播放会话和权威时钟，各客户端使用 FFmpeg 在本地
-完成媒体解码。视频流量和解码开销不会集中在服务端，同时所有玩家仍能看到同步的播放内容。
+Video Synchronizer 由服务端为每块屏幕维护独立播放会话和权威时钟，各客户端使用 FFmpeg
+在本地完成媒体解码。视频流量和解码开销不会集中在服务端，同时所有玩家仍能看到同步内容。
 
 ## 主要功能
 
 - 服务端统一控制播放、暂停、跳转、停止、重连和中途加入同步
-- 支持墙面、地面和天花板连续屏幕，最大 256 × 256 方块
+- 支持墙面、地面和天花板连续屏幕，最大 1024 x 1024 方块
+- 多块屏幕可同时运行相互独立的播放会话
+- 每个管理器可选择位置衰减、范围内恒定音量或全服满音量广播
+- 位置衰减会话会在客户端离开范围后卸载 FFmpeg 和媒体资源
+- 使用两角选区工具创建墙面、地面和天花板屏幕
 - 支持 HTTP(S) MP4、HLS，以及 DASH 音视频分流地址
+- 链接不是可直接播放的媒体或缺少所配置的音视频流时，会明确提醒玩家
 - 提供游戏内视频管理器 GUI 和 `/video` 命令
 - 自动限制高分辨率视频的输出尺寸和帧率
 - 支持硬件解码，并在失败时自动回退到软件解码
@@ -125,6 +136,7 @@ Modrinth 会列出五个独立版本，请根据客户端选择对应后缀：
 - 媒体由客户端本地解码，因此媒体地址和鉴权选项会发送给在线客户端。请勿填写不应向
   玩家公开的凭据。
 - 没有已知时长的直播流无法在播放结尾自动停止。
+- `/video stop` 会停止全部活动会话；视频管理器只停止它所控制的屏幕。
 - 内嵌 FFmpeg 使用 LGPL shared 构建，并附带相应许可证与源码说明。
 
 ## 链接与许可证

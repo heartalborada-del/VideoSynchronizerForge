@@ -17,13 +17,17 @@ import org.lwjgl.system.MemoryUtil;
 import javax.annotation.Nullable;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 public final class ScreenTexture {
-    public static final ScreenTexture INSTANCE = new ScreenTexture();
+    private static final Map<String, ScreenTexture> INSTANCES = new ConcurrentHashMap<>();
     private static final int PIXEL_BUFFER_COUNT = 2;
     private static final long DEBUG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10L);
 
+    private final String sessionId;
+    private final VideoFrameBuffer frameBuffer;
     private DynamicTexture texture;
     private ResourceLocation location;
     private int width;
@@ -46,13 +50,40 @@ public final class ScreenTexture {
     private long statsLastPositionMs;
     private VideoFrameBuffer.Stats previousBufferStats;
 
-    private ScreenTexture() {
+    public ScreenTexture(String sessionId, VideoFrameBuffer frameBuffer) {
+        this.sessionId = sessionId;
+        this.frameBuffer = frameBuffer;
+    }
+
+    public static ScreenTexture forSession(String sessionId, VideoFrameBuffer frameBuffer) {
+        return INSTANCES.computeIfAbsent(sessionId,
+                ignored -> new ScreenTexture(sessionId, frameBuffer));
+    }
+
+    public static ScreenTexture forSession(String sessionId) {
+        return INSTANCES.get(sessionId);
+    }
+
+    public static void updateAll() {
+        INSTANCES.values().forEach(ScreenTexture::update);
+    }
+
+    public static void closeSession(String sessionId) {
+        ScreenTexture texture = INSTANCES.remove(sessionId);
+        if (texture != null) {
+            texture.scheduleClose();
+        }
+    }
+
+    public static void closeAll() {
+        INSTANCES.values().forEach(ScreenTexture::scheduleClose);
+        INSTANCES.clear();
     }
 
     public void update() {
         RenderSystem.assertOnRenderThread();
         long now = System.nanoTime();
-        VideoFrameBuffer.Stats bufferStats = VideoFrameBuffer.INSTANCE.stats();
+        VideoFrameBuffer.Stats bufferStats = frameBuffer.stats();
         if (statsStartNanos == 0L && (texture != null || bufferStats.pendingFrame())) {
             resetDebugInterval(now, bufferStats);
             Main.LOGGER.debug("Video render diagnostics started (texturePresent={}, pendingFrame={})",
@@ -61,7 +92,7 @@ public final class ScreenTexture {
         if (statsStartNanos != 0L) {
             statsRenderTicks++;
         }
-        VideoFrameBuffer.DecodedFrame frame = VideoFrameBuffer.INSTANCE.take();
+        VideoFrameBuffer.DecodedFrame frame = frameBuffer.take();
         if (frame != null) {
             long uploadStart = System.nanoTime();
             upload(frame);
@@ -77,7 +108,7 @@ public final class ScreenTexture {
             statsEmptyTicks++;
         }
         if (statsStartNanos != 0L) {
-            logDebugInterval(now, VideoFrameBuffer.INSTANCE.stats());
+            logDebugInterval(now, frameBuffer.stats());
         }
     }
 
@@ -91,9 +122,9 @@ public final class ScreenTexture {
         RenderSystem.assertOnRenderThread();
         if (texture != null || statsStartNanos != 0L) {
             Main.LOGGER.debug("Closing video texture {}x{} (PBO={}, bufferStats={})",
-                    width, height, pixelBufferUpload, VideoFrameBuffer.INSTANCE.stats());
+                    width, height, pixelBufferUpload, frameBuffer.stats());
         }
-        VideoFrameBuffer.INSTANCE.clear();
+        frameBuffer.clear();
         releaseTexture();
         statsStartNanos = 0L;
         previousBufferStats = null;
@@ -131,12 +162,12 @@ public final class ScreenTexture {
 
             if (createdTexture) {
                 uploadDirect(frame.data(), frame.pixelFormat());
-                ClientVideoState.onFrameRendered(frame.positionMs());
+                ClientVideoState.onFrameRendered(sessionId, frame.positionMs());
                 return;
             }
             if (pixelBufferUpload && uploadWithPixelBuffer(
                     frame.data(), frame.pixelFormat())) {
-                ClientVideoState.onFrameRendered(frame.positionMs());
+                ClientVideoState.onFrameRendered(sessionId, frame.positionMs());
                 return;
             }
             if (pixelBufferUpload) {
@@ -144,9 +175,9 @@ public final class ScreenTexture {
                 Main.LOGGER.warn("Mapped video texture upload is unavailable; using direct upload");
             }
             uploadDirect(frame.data(), frame.pixelFormat());
-            ClientVideoState.onFrameRendered(frame.positionMs());
+            ClientVideoState.onFrameRendered(sessionId, frame.positionMs());
         } finally {
-            VideoFrameBuffer.INSTANCE.release(frame);
+            frameBuffer.release(frame);
         }
     }
 

@@ -2,7 +2,7 @@ package org.arkcraft.video_synchronizer.network;
 
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraftforge.network.NetworkEvent;
-import org.arkcraft.video_synchronizer.server.ServerVideoSession;
+import org.arkcraft.video_synchronizer.server.ServerVideoSessionManager;
 
 import java.util.function.Supplier;
 
@@ -24,7 +24,7 @@ public record VideoReadyMessage(String sessionId, long durationMs) {
         }
         var server = sender.getServer();
         if (server != null) {
-            ServerVideoSession.acceptReady(server, sender, message);
+            ServerVideoSessionManager.acceptReady(server, sender, message);
         }
     }
 }

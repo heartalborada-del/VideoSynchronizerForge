@@ -9,6 +9,7 @@ import java.util.function.Supplier;
 public record VideoStartMessage(String sessionId, String videoId, String videoUrl, String audioUrl,
                                 String requestHeaders, String cookie, boolean disableScaling,
                                 int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                                double audioRange, AudioPlaybackMode audioPlaybackMode,
                                 long durationMs,
                                 long positionMs, boolean playing,
                                 boolean waitingForClients, long revision,
@@ -16,10 +17,12 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
     public VideoStartMessage(String sessionId, String videoId, String videoUrl, String audioUrl,
                              String requestHeaders, String cookie, boolean disableScaling,
                              int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                             double audioRange, AudioPlaybackMode audioPlaybackMode,
                              long durationMs, long positionMs, boolean playing,
                              boolean waitingForClients, long revision, long sentAtNanos) {
         this(sessionId, videoId, videoUrl, audioUrl, requestHeaders, cookie, disableScaling,
-                videoPipeLanes, videoPixelFormat, durationMs, positionMs, playing,
+                videoPipeLanes, videoPixelFormat, audioRange, audioPlaybackMode,
+                durationMs, positionMs, playing,
                 waitingForClients, revision, sentAtNanos, 0L);
     }
 
@@ -33,6 +36,8 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
         buf.writeBoolean(disableScaling);
         buf.writeVarInt(videoPipeLanes);
         buf.writeEnum(videoPixelFormat);
+        buf.writeDouble(audioRange);
+        buf.writeEnum(audioPlaybackMode);
         buf.writeLong(durationMs);
         buf.writeLong(positionMs);
         buf.writeBoolean(playing);
@@ -47,6 +52,8 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
                 buf.readUtf(MediaRequestOptions.MAX_COOKIE_LENGTH), buf.readBoolean(),
                 buf.readVarInt(),
                 buf.readEnum(VideoPixelFormat.class),
+                buf.readDouble(),
+                buf.readEnum(AudioPlaybackMode.class),
                 buf.readLong(),
                 buf.readLong(), buf.readBoolean(), buf.readBoolean(), buf.readLong(),
                 buf.readLong(), System.nanoTime());

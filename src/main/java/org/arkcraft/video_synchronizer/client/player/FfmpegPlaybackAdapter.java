@@ -4,11 +4,15 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.client.Minecraft;
 import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.phys.Vec3;
 import org.arkcraft.video_synchronizer.Main;
+import org.arkcraft.video_synchronizer.client.ClientScreenTarget;
 import org.arkcraft.video_synchronizer.client.ClientVideoState;
 import org.arkcraft.video_synchronizer.client.render.ScreenTexture;
 import org.arkcraft.video_synchronizer.network.MediaRequestOptions;
+import org.arkcraft.video_synchronizer.network.AudioPlaybackMode;
 import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.VideoPlaybackErrorMessage;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -44,7 +48,6 @@ import javax.sound.sampled.SourceDataLine;
  * acceleration first; audio is streamed as PCM to the client's default output device.
  */
 public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAdapter {
-    public static final FfmpegPlaybackAdapter INSTANCE = new FfmpegPlaybackAdapter();
     private static final int MAX_SOURCE_DIMENSION = 4096;
     private static final long MAX_SOURCE_PIXELS = 4096L * 2160L;
     private static final int MAX_OUTPUT_WIDTH = positiveIntegerProperty(
@@ -72,6 +75,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static final int MAX_FFMPEG_ERROR_LENGTH = 8_192;
     private static final int AUDIO_SAMPLE_RATE = 48_000;
     private static final int AUDIO_CHANNELS = 2;
+    private static final double DEFAULT_AUDIO_MAX_DISTANCE = positiveDoubleProperty(
+            "video_synchronizer.audioMaxDistance", 48.0D);
     private static final int AUDIO_FRAME_SIZE = AUDIO_CHANNELS * Short.BYTES;
     private static final int AUDIO_CHUNK_FRAMES = AUDIO_SAMPLE_RATE / 50;
     private static final int AUDIO_BUFFER_FRAMES = AUDIO_SAMPLE_RATE / 10;
@@ -121,7 +126,10 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private final AtomicLong requestedSeekMs = new AtomicLong(-1L);
     private final AtomicLong videoDiscardUntilMs = new AtomicLong(-1L);
     private final AtomicLong seekPreparationGeneration = new AtomicLong();
-    private final AtomicLong reportedHttpErrorGeneration = new AtomicLong(-1L);
+    private final AtomicLong reportedPlaybackErrorGeneration = new AtomicLong(-1L);
+    private final String sessionId;
+    private final VideoFrameBuffer frameBuffer = new VideoFrameBuffer();
+    private final ScreenTexture screenTexture;
     private final AudioPlayback audioPlayback = new AudioPlayback();
 
     private volatile Process process;
@@ -134,6 +142,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private volatile boolean disableScaling;
     private volatile int activeVideoPipeLanes = VIDEO_PIPE_LANES;
     private volatile VideoPixelFormat activeVideoPixelFormat = VideoPixelFormat.RGB24;
+    private volatile double audioMaxDistance = DEFAULT_AUDIO_MAX_DISTANCE;
+    private volatile AudioPlaybackMode audioPlaybackMode = AudioPlaybackMode.POSITIONAL;
     private volatile boolean forceVideoPipeLanes;
     private volatile DecodeMode preferredDecodeMode;
     private PreparedVideoDecoder preparedVideoDecoder;
@@ -162,8 +172,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private volatile boolean videoReconnecting;
     private volatile long lastVideoFrameNanos;
     private volatile long lastCatchUpSeekNanos;
+    private volatile SpatialAudioState spatialAudioState = SpatialAudioState.FULL_VOLUME;
 
-    private FfmpegPlaybackAdapter() {
+    public FfmpegPlaybackAdapter(String sessionId) {
+        this.sessionId = sessionId;
+        this.screenTexture = ScreenTexture.forSession(sessionId, frameBuffer);
     }
 
     public static boolean prepareExecutables() {
@@ -182,6 +195,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     public synchronized void open(String videoId, String videoUrl, String audioUrl,
                                   String requestHeaders, String cookie, boolean disableScaling,
                                   int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                                  double audioRange,
+                                  AudioPlaybackMode audioPlaybackMode,
                                   long durationMs) {
         MediaRequestOptions requestOptions = new MediaRequestOptions(requestHeaders, cookie);
         int resolvedVideoPipeLanes = resolveVideoPipeLanes(videoPipeLanes);
@@ -202,8 +217,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 !requestOptions.cookie().isBlank());
         destroyProcess();
         audioPlayback.close();
-        VideoFrameBuffer.INSTANCE.clear();
-        ScreenTexture.INSTANCE.scheduleClose();
+        frameBuffer.clear();
+        screenTexture.scheduleClose();
         this.durationMs = durationMs;
         this.anchorPositionMs = 0L;
         this.anchorNanos = System.nanoTime();
@@ -222,6 +237,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         this.videoReconnecting = false;
         this.lastVideoFrameNanos = 0L;
         this.lastCatchUpSeekNanos = 0L;
+        this.spatialAudioState = SpatialAudioState.SILENT;
         this.activeMetadata = null;
         this.activeMediaUrl = videoUrl;
         this.activeAudioUrl = audioUrl == null || audioUrl.isBlank() ? null : audioUrl;
@@ -231,6 +247,10 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         this.forceVideoPipeLanes = videoPipeLanes > 0;
         this.activeVideoPixelFormat = videoPixelFormat == null
                 ? VideoPixelFormat.RGB24 : videoPixelFormat;
+        this.audioMaxDistance = Double.isFinite(audioRange) && audioRange > 0.0D
+                ? audioRange : DEFAULT_AUDIO_MAX_DISTANCE;
+        this.audioPlaybackMode = audioPlaybackMode == null
+                ? AudioPlaybackMode.POSITIONAL : audioPlaybackMode;
         String sessionAudioUrl = this.activeAudioUrl;
         this.preferredDecodeMode = null;
         cancelPreparedSeek();
@@ -272,7 +292,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 clockStarted = false;
             }
             videoDiscardUntilMs.set(boundedPosition);
-            VideoFrameBuffer.INSTANCE.clear();
+            frameBuffer.clear();
             audioPlayback.skipForward(boundedPosition);
             Main.LOGGER.debug("Soft-forwarding synchronized playback: current={} ms, "
                             + "target={} ms, distance={} ms",
@@ -301,7 +321,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     boundedPosition);
             clockStarted = false;
             videoDiscardUntilMs.set(-1L);
-            VideoFrameBuffer.INSTANCE.clear();
+            frameBuffer.clear();
             requestedSeekMs.set(boundedPosition);
             destroyDecoderProcess();
             audioPlayback.seek(boundedPosition);
@@ -387,7 +407,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             return;
         }
         preloadDiagnosticsLogged = true;
-        VideoFrameBuffer.Stats bufferStats = VideoFrameBuffer.INSTANCE.stats();
+        VideoFrameBuffer.Stats bufferStats = frameBuffer.stats();
         double fps = activeMetadata == null ? 0.0D : activeMetadata.framesPerSecond;
         long frameDurationMs = fps > 0.0D ? Math.max(1L, Math.round(1000.0D / fps)) : 0L;
         long verifiedPreloadMediaMs = preloadFrameDecoded ? frameDurationMs : 0L;
@@ -415,7 +435,50 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
 
     @Override
     public void clientTick() {
+        updateSpatialAudioState();
         audioPlayback.checkOutputHealth();
+    }
+
+    private void updateSpatialAudioState() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player == null || minecraft.level == null) {
+            spatialAudioState = SpatialAudioState.SILENT;
+            return;
+        }
+        AudioPlaybackMode mode = audioPlaybackMode;
+        if (mode == AudioPlaybackMode.GLOBAL) {
+            spatialAudioState = SpatialAudioState.FULL_VOLUME;
+            return;
+        }
+        ClientScreenTarget.SourcePosition source = ClientScreenTarget.sourcePosition(sessionId);
+        if (source == null) {
+            spatialAudioState = SpatialAudioState.FULL_VOLUME;
+            return;
+        }
+        if (!source.dimension().equals(minecraft.level.dimension().location().toString())) {
+            spatialAudioState = SpatialAudioState.SILENT;
+            return;
+        }
+        Vec3 delta = source.position().subtract(minecraft.player.getEyePosition());
+        double distance = delta.length();
+        double maxDistance = audioMaxDistance;
+        if (distance >= maxDistance) {
+            spatialAudioState = SpatialAudioState.SILENT;
+            return;
+        }
+        double attenuation = mode == AudioPlaybackMode.FIXED_RANGE ? 1.0D
+                : Math.max(0.0D, 1.0D - distance / maxDistance);
+        if (mode == AudioPlaybackMode.POSITIONAL) {
+            attenuation *= attenuation;
+        }
+        Vec3 direction = distance < 0.001D ? Vec3.ZERO : delta.scale(1.0D / distance);
+        Vec3 right = minecraft.player.getLookAngle().cross(new Vec3(0.0D, 1.0D, 0.0D));
+        right = right.lengthSqr() < 0.0001D
+                ? new Vec3(1.0D, 0.0D, 0.0D) : right.normalize();
+        double pan = Math.max(-1.0D, Math.min(1.0D, direction.dot(right)));
+        spatialAudioState = new SpatialAudioState(
+                attenuation * (pan > 0.0D ? 1.0D - pan : 1.0D),
+                attenuation * (pan < 0.0D ? 1.0D + pan : 1.0D));
     }
 
     @Override
@@ -439,13 +502,14 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         videoReconnecting = false;
         lastVideoFrameNanos = 0L;
         lastCatchUpSeekNanos = 0L;
+        spatialAudioState = SpatialAudioState.SILENT;
         requestedSeekMs.set(-1L);
         videoDiscardUntilMs.set(-1L);
         cancelPreparedSeek();
         destroyProcess();
         audioPlayback.close();
-        VideoFrameBuffer.INSTANCE.clear();
-        ScreenTexture.INSTANCE.scheduleClose();
+        frameBuffer.clear();
+        screenTexture.scheduleClose();
         activeMetadata = null;
         activeMediaUrl = null;
         activeAudioUrl = null;
@@ -453,8 +517,20 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         disableScaling = false;
         activeVideoPipeLanes = VIDEO_PIPE_LANES;
         activeVideoPixelFormat = VideoPixelFormat.RGB24;
+        audioMaxDistance = DEFAULT_AUDIO_MAX_DISTANCE;
+        audioPlaybackMode = AudioPlaybackMode.POSITIONAL;
         forceVideoPipeLanes = false;
         preferredDecodeMode = null;
+    }
+
+    @Override
+    public synchronized void dispose() {
+        close();
+        ScreenTexture.closeSession(sessionId);
+        audioPlayback.dispose();
+        executor.shutdownNow();
+        seekTimeoutExecutor.shutdownNow();
+        decoderWatchdogExecutor.shutdownNow();
     }
 
     private void runSession(long sessionGeneration, String mediaUrl, String separateAudioUrl) {
@@ -466,6 +542,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             VideoMetadata metadata = probe(mediaUrl, sessionGeneration);
             if (generation.get() != sessionGeneration) {
                 return;
+            }
+            if (separateAudioUrl != null) {
+                probeAudio(separateAudioUrl, sessionGeneration);
             }
             if (metadata.durationMs > 0L) {
                 durationMs = metadata.durationMs;
@@ -584,6 +663,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
         } catch (HttpStatusException ignored) {
             // The client has reported the status to the authoritative server.
+        } catch (MediaSourceException exception) {
+            reportPlaybackError(sessionGeneration, exception.reason, 0);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
         } catch (Exception exception) {
@@ -831,7 +912,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     return DecodeResult.SEEK_REQUESTED;
                 }
                 byte[] frameData = preparedFrame != null
-                        ? preparedFrame : VideoFrameBuffer.INSTANCE.acquire(frameSize);
+                        ? preparedFrame : frameBuffer.acquire(frameSize);
                 long readStartNanos = System.nanoTime();
                 FrameReadOutcome readOutcome;
                 if (preparedFrame != null) {
@@ -857,7 +938,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             readOutcome.bytesRead, frameSize, readOutcome.readCalls,
                             readOutcome.emptyPolls, framePosition, decodedFrames,
                             requestedSeekMs.get());
-                    VideoFrameBuffer.INSTANCE.release(
+                    frameBuffer.release(
                             new VideoFrameBuffer.DecodedFrame(
                                     outputDimensions.width, outputDimensions.height,
                                     framePosition, pixelFormat, frameData));
@@ -880,7 +961,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 }
 
                 if (!waitForVideoPlayback(sessionGeneration)) {
-                    VideoFrameBuffer.INSTANCE.release(
+                    frameBuffer.release(
                             new VideoFrameBuffer.DecodedFrame(
                                     outputDimensions.width, outputDimensions.height,
                                     framePosition, pixelFormat, frameData));
@@ -897,7 +978,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 }
                 if (requiredFramePosition >= 0L
                         && framePosition + 75L < requiredFramePosition) {
-                    VideoFrameBuffer.INSTANCE.release(
+                    frameBuffer.release(
                             new VideoFrameBuffer.DecodedFrame(
                                     outputDimensions.width, outputDimensions.height,
                                     framePosition, pixelFormat, frameData));
@@ -927,7 +1008,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         >= VIDEO_CATCH_UP_COOLDOWN_NANOS
                         && requestedSeekMs.compareAndSet(-1L, playbackPosition)) {
                     lastCatchUpSeekNanos = catchUpNow;
-                    VideoFrameBuffer.INSTANCE.release(
+                    frameBuffer.release(
                             new VideoFrameBuffer.DecodedFrame(
                                     outputDimensions.width, outputDimensions.height,
                                     framePosition, pixelFormat, frameData));
@@ -947,7 +1028,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 }
                 long pacingNanos = System.nanoTime() - pacingStartNanos;
                 if (generation.get() != sessionGeneration || requestedSeekMs.get() >= 0L) {
-                    VideoFrameBuffer.INSTANCE.release(
+                    frameBuffer.release(
                             new VideoFrameBuffer.DecodedFrame(
                                     outputDimensions.width, outputDimensions.height,
                                     framePosition, pixelFormat, frameData));
@@ -979,7 +1060,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 VideoFrameBuffer.DecodedFrame frame = new VideoFrameBuffer.DecodedFrame(
                         outputDimensions.width, outputDimensions.height, framePosition,
                         pixelFormat, frameData);
-                VideoFrameBuffer.INSTANCE.submit(frame);
+                frameBuffer.submit(frame);
                 submittedFrame = true;
                 if (preloading) {
                     preloadFrameDecoded = true;
@@ -1008,7 +1089,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     double averageFirstByteMs = statsDecodedFrames == 0L ? 0.0D
                             : statsFirstByteDelayNanos / 1_000_000.0D / statsDecodedFrames;
                     long clockPosition = positionMs();
-                    VideoFrameBuffer.Stats bufferStats = VideoFrameBuffer.INSTANCE.stats();
+                    VideoFrameBuffer.Stats bufferStats = frameBuffer.stats();
                     Main.LOGGER.debug("Video decode stats: pid={}, mode={}, frames={} ({} fps, "
                                     + "rawOutput={} MiB/s), totalFrames={}, media={} ms, clock={} ms, "
                                     + "drift={} ms, readAvg={} ms, readMax={} ms, pacing={} ms, "
@@ -1163,7 +1244,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         ErrorCollector errors = new ErrorCollector(candidate.getErrorStream());
         errors.start();
         InputStream output = candidate.getInputStream();
-        byte[] frame = VideoFrameBuffer.INSTANCE.acquire(videoCommand.frameSize);
+        byte[] frame = frameBuffer.acquire(videoCommand.frameSize);
         int offset = 0;
         long firstByteNanos = -1L;
         String failureReason = "cancelled";
@@ -1201,7 +1282,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     videoCommand.pixelFormat);
         } finally {
             if (offset < frame.length) {
-                VideoFrameBuffer.INSTANCE.release(new VideoFrameBuffer.DecodedFrame(
+                frameBuffer.release(new VideoFrameBuffer.DecodedFrame(
                         videoCommand.outputDimensions.width,
                         videoCommand.outputDimensions.height, positionMs,
                         videoCommand.pixelFormat, frame));
@@ -1276,7 +1357,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         anchorNanos = nowNanos;
         clockStarted = false;
         videoDiscardUntilMs.set(-1L);
-        VideoFrameBuffer.INSTANCE.clear();
+        frameBuffer.clear();
         activatedSeekPreparation = preparation;
         audioPlayback.activatePreparedSeek(preparation, positionMs,
                 pendingSeekNeedsAudio && !pendingAudioFailed);
@@ -1324,7 +1405,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         anchorNanos = System.nanoTime();
         clockStarted = false;
         videoDiscardUntilMs.set(-1L);
-        VideoFrameBuffer.INSTANCE.clear();
+        frameBuffer.clear();
         requestedSeekMs.set(positionMs);
         destroyDecoderProcess();
         audioPlayback.seek(positionMs);
@@ -1587,7 +1668,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     reportHttpError(sessionGeneration, httpStatus);
                     throw new HttpStatusException(httpStatus);
                 }
-                throw new IOException("ffprobe could not read video metadata");
+                throw new MediaSourceException(
+                        VideoPlaybackErrorMessage.Reason.VIDEO_UNPLAYABLE,
+                        "ffprobe could not read video metadata");
             }
             root = JsonParser.parseString(probeOutput).getAsJsonObject();
         } finally {
@@ -1597,7 +1680,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             clearProcess(probe);
         }
         if (!root.has("streams") || root.getAsJsonArray("streams").size() == 0) {
-            throw new IOException("ffprobe did not find a video stream");
+            throw new MediaSourceException(VideoPlaybackErrorMessage.Reason.VIDEO_UNPLAYABLE,
+                    "ffprobe did not find a video stream");
         }
         JsonObject stream = null;
         boolean hasAudio = false;
@@ -1612,7 +1696,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
         }
         if (stream == null) {
-            throw new IOException("ffprobe did not find a video stream");
+            throw new MediaSourceException(VideoPlaybackErrorMessage.Reason.VIDEO_UNPLAYABLE,
+                    "ffprobe did not find a video stream");
         }
         int width = stream.get("width").getAsInt();
         int height = stream.get("height").getAsInt();
@@ -1657,6 +1742,73 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 detectedDurationMs, hasAudio);
         return new VideoMetadata(width, height, fps, detectedDurationMs, hasAudio,
                 codecName, profile, pixelFormat, bitRate);
+    }
+
+    private void probeAudio(String mediaUrl, long sessionGeneration)
+            throws IOException, InterruptedException {
+        List<String> command = new ArrayList<>();
+        command.add(ffprobeExecutable());
+        command.add("-v");
+        command.add("error");
+        addNetworkInputOptions(command);
+        command.add("-show_entries");
+        command.add("stream=codec_type");
+        command.add("-of");
+        command.add("json");
+        command.add(mediaUrl);
+        Process probe = EmbeddedFfmpeg.processBuilder(command)
+                .redirectErrorStream(true).start();
+        if (!registerProcess(probe, sessionGeneration, false)) {
+            terminateProcessTree(probe);
+            throw new IOException("Video session was cancelled");
+        }
+        try {
+            long deadlineNanos = System.nanoTime()
+                    + TimeUnit.SECONDS.toNanos(PROBE_TIMEOUT_SECONDS);
+            while (probe.isAlive()) {
+                if (generation.get() != sessionGeneration) {
+                    throw new IOException("Video session was cancelled during audio probing");
+                }
+                if (System.nanoTime() >= deadlineNanos) {
+                    throw new IOException("ffprobe timed out while checking the audio stream");
+                }
+                probe.waitFor(1L, TimeUnit.SECONDS);
+            }
+            String output = new String(probe.getInputStream().readAllBytes(),
+                    StandardCharsets.UTF_8);
+            if (probe.exitValue() != 0) {
+                int httpStatus = findHttpErrorStatus(output);
+                if (httpStatus >= 0) {
+                    reportHttpError(sessionGeneration, httpStatus);
+                    throw new HttpStatusException(httpStatus);
+                }
+                throw new MediaSourceException(
+                        VideoPlaybackErrorMessage.Reason.AUDIO_UNPLAYABLE,
+                        "ffprobe could not read audio metadata");
+            }
+            JsonObject root = JsonParser.parseString(output).getAsJsonObject();
+            boolean hasAudio = false;
+            if (root.has("streams")) {
+                for (var element : root.getAsJsonArray("streams")) {
+                    JsonObject stream = element.getAsJsonObject();
+                    if (stream.has("codec_type")
+                            && "audio".equals(stream.get("codec_type").getAsString())) {
+                        hasAudio = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasAudio) {
+                throw new MediaSourceException(
+                        VideoPlaybackErrorMessage.Reason.AUDIO_UNPLAYABLE,
+                        "ffprobe did not find an audio stream");
+            }
+        } finally {
+            if (probe.isAlive()) {
+                terminateProcessTree(probe);
+            }
+            clearProcess(probe);
+        }
     }
 
     private static String jsonString(JsonObject object, String name, String fallback) {
@@ -1711,8 +1863,16 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     }
 
     private void reportHttpError(long sessionGeneration, int statusCode) {
+        reportPlaybackError(sessionGeneration,
+                VideoPlaybackErrorMessage.Reason.HTTP_ERROR, statusCode);
+    }
+
+    private void reportPlaybackError(long sessionGeneration,
+                                     VideoPlaybackErrorMessage.Reason reason,
+                                     int statusCode) {
         if (generation.get() != sessionGeneration
-                || reportedHttpErrorGeneration.getAndSet(sessionGeneration) == sessionGeneration) {
+                || reportedPlaybackErrorGeneration.getAndSet(sessionGeneration)
+                == sessionGeneration) {
             return;
         }
         playing = false;
@@ -1724,9 +1884,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             destroyProcess();
             audioPlayback.close();
-            VideoFrameBuffer.INSTANCE.clear();
-            ScreenTexture.INSTANCE.scheduleClose();
-            ClientVideoState.reportHttpError(statusCode);
+            frameBuffer.clear();
+            screenTexture.scheduleClose();
+            ClientVideoState.reportPlaybackError(sessionId, reason, statusCode);
         });
     }
 
@@ -1954,6 +2114,16 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         return value > 0 ? value : fallback;
     }
 
+    private static double positiveDoubleProperty(String name, double fallback) {
+        try {
+            double value = Double.parseDouble(
+                    System.getProperty(name, Double.toString(fallback)));
+            return Double.isFinite(value) && value > 0.0D ? value : fallback;
+        } catch (NumberFormatException ignored) {
+            return fallback;
+        }
+    }
+
     private synchronized void destroyProcess() {
         Process running = process;
         if (running != null) {
@@ -2018,7 +2188,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     }
 
     private void closePreparedVideoDecoder(PreparedVideoDecoder prepared) {
-        VideoFrameBuffer.INSTANCE.release(new VideoFrameBuffer.DecodedFrame(
+        frameBuffer.release(new VideoFrameBuffer.DecodedFrame(
                 prepared.outputDimensions.width, prepared.outputDimensions.height,
                 prepared.positionMs, prepared.pixelFormat, prepared.firstFrame));
         try {
@@ -2282,12 +2452,26 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         }
     }
 
+    private static final class MediaSourceException extends IOException {
+        private final VideoPlaybackErrorMessage.Reason reason;
+
+        private MediaSourceException(VideoPlaybackErrorMessage.Reason reason, String message) {
+            super(message);
+            this.reason = reason;
+        }
+    }
+
     private enum AudioDecodeResult {
         SEEK_REQUESTED,
         HTTP_ERROR,
         ENDED_BEFORE_AUDIO,
         ENDED_AFTER_AUDIO,
         ENDED_AFTER_STABLE_AUDIO
+    }
+
+    private record SpatialAudioState(double leftGain, double rightGain) {
+        private static final SpatialAudioState FULL_VOLUME = new SpatialAudioState(1.0D, 1.0D);
+        private static final SpatialAudioState SILENT = new SpatialAudioState(0.0D, 0.0D);
     }
 
     private enum DecodeMode {
@@ -2479,6 +2663,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             cancelPreparedSeek();
         }
 
+        private synchronized void dispose() {
+            close();
+            executor.shutdownNow();
+        }
+
         private void startWorkerLocked() {
             if (workerRunning || mediaUrl == null) {
                 Main.LOGGER.debug("Audio worker start skipped: workerRunning={}, mediaPresent={}",
@@ -2553,6 +2742,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     if (!shouldRestartAudio(sessionGeneration)
                             || !prepareAudioRestart(sessionGeneration,
                             restartAttempts, "decoder stream ended")) {
+                        if (result == AudioDecodeResult.ENDED_BEFORE_AUDIO
+                                && !audioEstablished && isActive(sessionGeneration)) {
+                            reportPlaybackError(sessionGeneration,
+                                    VideoPlaybackErrorMessage.Reason.AUDIO_UNPLAYABLE, 0);
+                        }
                         break;
                     }
                     restartAttempts++;
@@ -2786,6 +2980,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         appliedVolume = updateVolume(line, appliedVolume);
                         nextVolumeUpdateNanos = now + TimeUnit.MILLISECONDS.toNanos(250L);
                     }
+                    spatializeAudio(pcm, bytesRead);
                     writeAudio(line, pcm, bytesRead, readWatchdog);
                     boolean recovered = reconnecting;
                     reconnecting = false;
@@ -3002,6 +3197,34 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 }
             } finally {
                 watchdog.end();
+            }
+        }
+
+        /** Applies the client-thread listener snapshot to PCM in-place. */
+        private void spatializeAudio(byte[] data, int length) {
+            SpatialAudioState spatial = spatialAudioState;
+            if (spatial == SpatialAudioState.FULL_VOLUME) {
+                return;
+            }
+            if (spatial == SpatialAudioState.SILENT) {
+                java.util.Arrays.fill(data, 0, length, (byte) 0);
+                return;
+            }
+            for (int offset = 0; offset + AUDIO_FRAME_SIZE <= length;
+                 offset += AUDIO_FRAME_SIZE) {
+                int left = (short) ((data[offset] & 0xFF) | (data[offset + 1] << 8));
+                int rightSample = (short) ((data[offset + 2] & 0xFF)
+                        | (data[offset + 3] << 8));
+                int mono = (left + rightSample) / 2;
+                int scaledLeft = (int) Math.max(Short.MIN_VALUE,
+                        Math.min(Short.MAX_VALUE, Math.round(mono * spatial.leftGain())));
+                int scaledRight = (int) Math.max(Short.MIN_VALUE,
+                        Math.min(Short.MAX_VALUE,
+                                Math.round(mono * spatial.rightGain())));
+                data[offset] = (byte) scaledLeft;
+                data[offset + 1] = (byte) (scaledLeft >> 8);
+                data[offset + 2] = (byte) scaledRight;
+                data[offset + 3] = (byte) (scaledRight >> 8);
             }
         }
 

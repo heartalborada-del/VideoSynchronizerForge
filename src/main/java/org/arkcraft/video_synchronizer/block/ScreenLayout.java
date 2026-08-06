@@ -6,7 +6,7 @@ import net.minecraft.world.level.block.state.BlockState;
 
 public record ScreenLayout(int column, int row, int width, int height) {
     public static final ScreenLayout SINGLE = new ScreenLayout(0, 0, 1, 1);
-    public static final int MAX_DIMENSION = 256;
+    public static final int MAX_DIMENSION = 1024;
 
     public static ScreenLayout detect(BlockGetter level, BlockPos origin, ScreenOrientation orientation) {
         int minColumn = scanHorizontal(level, origin, orientation, -1, MAX_DIMENSION - 1);

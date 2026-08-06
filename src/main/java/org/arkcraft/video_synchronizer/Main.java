@@ -23,6 +23,7 @@ import org.arkcraft.video_synchronizer.block.ScreenBlockEntity;
 import org.arkcraft.video_synchronizer.block.VideoManagerBlock;
 import org.arkcraft.video_synchronizer.block.VideoManagerBlockEntity;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
+import org.arkcraft.video_synchronizer.item.ScreenSelectionToolItem;
 import org.slf4j.Logger;
 
 @Mod(Main.MODID)
@@ -51,6 +52,8 @@ public final class Main {
                     .noLootTable()));
     public static final RegistryObject<Item> VIDEO_MANAGER_ITEM = ITEMS.register("video_manager",
             () -> new BlockItem(VIDEO_MANAGER_BLOCK.get(), new Item.Properties()));
+    public static final RegistryObject<Item> SCREEN_SELECTION_TOOL = ITEMS.register(
+            "screen_selection_tool", () -> new ScreenSelectionToolItem(new Item.Properties()));
     public static final RegistryObject<BlockEntityType<VideoManagerBlockEntity>> VIDEO_MANAGER_BLOCK_ENTITY =
             BLOCK_ENTITIES.register("video_manager", () -> BlockEntityType.Builder
                     .of(VideoManagerBlockEntity::new, VIDEO_MANAGER_BLOCK.get()).build(null));
@@ -62,6 +65,7 @@ public final class Main {
                     .displayItems((parameters, output) -> {
                         output.accept(SCREEN_ITEM.get());
                         output.accept(VIDEO_MANAGER_ITEM.get());
+                        output.accept(SCREEN_SELECTION_TOOL.get());
                     })
                     .build());
 
