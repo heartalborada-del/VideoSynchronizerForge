@@ -44,7 +44,10 @@
   "overlay.video_synchronizer.progress_buffering": "Buffering",
   "overlay.video_synchronizer.progress_syncing": "Syncing",
   "overlay.video_synchronizer.progress_reconnecting": "Reconnecting",
+  "overlay.video_synchronizer.ffmpeg_checking": "Checking FFmpeg and ffprobe",
+  "overlay.video_synchronizer.ffmpeg_unavailable": "Local playback unavailable: FFmpeg check failed",
   "command.video_synchronizer.bossbar.idle": "Video status: idle",
+  "command.video_synchronizer.bossbar.unavailable": "Local video unavailable: FFmpeg check failed",
   "command.video_synchronizer.bossbar.waiting": "Preloading %s/%s | Local: %s",
   "command.video_synchronizer.bossbar.no_report": "Waiting for local report | Server %s / %s",
   "command.video_synchronizer.bossbar.playback": "Local %s / %s | Drift %sms | %s | Report age %sms",
@@ -60,7 +63,9 @@
   "command.video_synchronizer.status.readiness": "Preload: %s/%s ready | Local: %s",
   "command.video_synchronizer.status.ready": "ready",
   "command.video_synchronizer.status.not_ready": "not ready",
+  "command.video_synchronizer.status.unavailable": "unavailable",
   "command.video_synchronizer.status.not_applicable": "n/a",
+  "command.video_synchronizer.status.local_unavailable": "Local: unavailable because FFmpeg or ffprobe failed validation",
   "command.video_synchronizer.status.local_missing": "Local: waiting for the first playback report",
   "command.video_synchronizer.status.local": "Local: %s | Drift: %sms | Report age: %sms | State: %s",
   "command.video_synchronizer.status.buffering": "buffering",
@@ -68,5 +73,6 @@
   "command.video_synchronizer.status.paused": "paused",
   "command.video_synchronizer.status.unbound": "unbound",
   "message.video_synchronizer.playback_protected": "Stop playback before breaking this block",
+  "message.video_synchronizer.ffmpeg_unavailable": "FFmpeg and ffprobe are unavailable; local video playback is disabled",
   "message.video_synchronizer.http_error": "Media URL responded with HTTP %s %s; playback stopped"
 }

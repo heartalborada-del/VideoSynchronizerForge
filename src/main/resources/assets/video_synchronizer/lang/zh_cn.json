@@ -44,7 +44,10 @@
   "overlay.video_synchronizer.progress_buffering": "缓冲中",
   "overlay.video_synchronizer.progress_syncing": "同步",
   "overlay.video_synchronizer.progress_reconnecting": "重连中",
+  "overlay.video_synchronizer.ffmpeg_checking": "正在检测 FFmpeg 和 ffprobe",
+  "overlay.video_synchronizer.ffmpeg_unavailable": "本地播放不可用：FFmpeg 检测失败",
   "command.video_synchronizer.bossbar.idle": "视频状态：空闲",
+  "command.video_synchronizer.bossbar.unavailable": "本地视频不可用：FFmpeg 检测失败",
   "command.video_synchronizer.bossbar.waiting": "预载 %s/%s | 本地：%s",
   "command.video_synchronizer.bossbar.no_report": "等待本地上报 | 服务端 %s / %s",
   "command.video_synchronizer.bossbar.playback": "本地 %s / %s | 偏差 %s毫秒 | %s | 上报延迟 %s毫秒",
@@ -60,7 +63,9 @@
   "command.video_synchronizer.status.readiness": "预载：%s/%s 已就绪 | 本地：%s",
   "command.video_synchronizer.status.ready": "已就绪",
   "command.video_synchronizer.status.not_ready": "未就绪",
+  "command.video_synchronizer.status.unavailable": "不可用",
   "command.video_synchronizer.status.not_applicable": "不适用",
+  "command.video_synchronizer.status.local_unavailable": "本地：FFmpeg 或 ffprobe 校验失败，播放不可用",
   "command.video_synchronizer.status.local_missing": "本地：正在等待首次播放上报",
   "command.video_synchronizer.status.local": "本地：%s | 偏差：%s毫秒 | 上报延迟：%s毫秒 | 状态：%s",
   "command.video_synchronizer.status.buffering": "缓冲中",
@@ -68,5 +73,6 @@
   "command.video_synchronizer.status.paused": "已暂停",
   "command.video_synchronizer.status.unbound": "未绑定",
   "message.video_synchronizer.playback_protected": "请先停止播放再破坏此方块",
+  "message.video_synchronizer.ffmpeg_unavailable": "FFmpeg 和 ffprobe 不可用，本地视频播放功能已禁用",
   "message.video_synchronizer.http_error": "媒体 URL 响应 HTTP %s %s，播放已停止"
 }

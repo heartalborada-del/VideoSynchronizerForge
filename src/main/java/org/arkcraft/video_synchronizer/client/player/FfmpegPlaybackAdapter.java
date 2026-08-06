@@ -166,9 +166,16 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private FfmpegPlaybackAdapter() {
     }
 
-    public static void prepareExecutables() {
-        EmbeddedFfmpeg.ffmpegExecutable();
-        EmbeddedFfmpeg.ffprobeExecutable();
+    public static boolean prepareExecutables() {
+        try {
+            EmbeddedFfmpeg.verifyExecutables();
+            Main.LOGGER.info("FFmpeg and ffprobe executable checks passed");
+            return true;
+        } catch (Exception exception) {
+            Main.LOGGER.error("FFmpeg and ffprobe are unavailable; local video playback "
+                    + "will be disabled", exception);
+            return false;
+        }
     }
 
     @Override

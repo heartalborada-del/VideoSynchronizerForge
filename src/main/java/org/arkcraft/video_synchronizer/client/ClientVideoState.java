@@ -5,6 +5,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import org.arkcraft.video_synchronizer.Main;
 import org.arkcraft.video_synchronizer.client.gui.VideoManagerScreen;
+import org.arkcraft.video_synchronizer.network.VideoClientCapabilityMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.network.VideoLocalPauseMessage;
 import org.arkcraft.video_synchronizer.network.VideoHttpErrorMessage;
@@ -34,6 +35,10 @@ public final class ClientVideoState {
     private static final long PROGRESS_SWITCH_DISPLAY_NANOS = TimeUnit.SECONDS.toNanos(2L);
 
     private static PlaybackAdapter adapter;
+    private static boolean playbackAvailabilityKnown;
+    private static boolean playbackAvailable;
+    private static boolean capabilityReported;
+    private static boolean availabilityNoticeShown;
     private static String sessionId;
     private static String videoId;
     private static String videoUrl;
@@ -82,6 +87,22 @@ public final class ClientVideoState {
         }
     }
 
+    public static void setPlaybackAvailability(boolean available) {
+        playbackAvailabilityKnown = true;
+        playbackAvailable = available;
+        capabilityReported = false;
+        availabilityNoticeShown = false;
+        if (!available && adapter != null) {
+            adapter.close();
+            adapter = null;
+        }
+        maybeReportPlaybackCapability();
+    }
+
+    public static boolean isPlaybackAvailable() {
+        return playbackAvailabilityKnown && playbackAvailable;
+    }
+
     public static void acceptStart(VideoStartMessage message) {
         if (sessionId != null && sessionId.equals(message.sessionId()) && message.revision() < revision) {
             return;
@@ -117,7 +138,9 @@ public final class ClientVideoState {
         if (!sameSession) {
             lastReportNanos = 0L;
         }
-        maybeRequestTimeSync();
+        if (playbackAvailable) {
+            maybeRequestTimeSync();
+        }
         if (!sameSession && clientPaused) {
             clientPauseStartedNanos = System.nanoTime();
             clientPauseSessionId = sessionId;
@@ -212,11 +235,16 @@ public final class ClientVideoState {
     }
 
     public static void clientTick() {
+        maybeReportPlaybackCapability();
+        maybeShowPlaybackUnavailableNotice();
         if (sessionId == null) {
             return;
         }
-        maybeRequestTimeSync();
         updateProgressOverlay();
+        if (!playbackAvailable) {
+            return;
+        }
+        maybeRequestTimeSync();
         if (adapter != null) {
             adapter.clientTick();
         }
@@ -277,7 +305,8 @@ public final class ClientVideoState {
         if (paused) {
             clientPauseStartedNanos = nowNanos;
             clientPauseSessionId = sessionId;
-        } else if (sessionId != null && sessionId.equals(clientPauseSessionId)) {
+        } else if (playbackAvailable && sessionId != null
+                && sessionId.equals(clientPauseSessionId)) {
             long pausedDurationMs = TimeUnit.NANOSECONDS.toMillis(
                     Math.max(0L, nowNanos - clientPauseStartedNanos));
             VideoNetwork.CHANNEL.sendToServer(new VideoLocalPauseMessage(
@@ -359,6 +388,8 @@ public final class ClientVideoState {
         playing = false;
         waitingForClients = false;
         readinessReported = false;
+        capabilityReported = false;
+        availabilityNoticeShown = false;
         clientPaused = false;
         clientPauseStartedNanos = 0L;
         clientPauseSequence = 0L;
@@ -375,6 +406,17 @@ public final class ClientVideoState {
     private static void updateProgressOverlay() {
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.player == null) {
+            return;
+        }
+        if (!playbackAvailable) {
+            String statusKey = playbackAvailabilityKnown
+                    ? "overlay.video_synchronizer.ffmpeg_unavailable"
+                    : "overlay.video_synchronizer.ffmpeg_checking";
+            ChatFormatting color = playbackAvailabilityKnown
+                    ? ChatFormatting.RED : ChatFormatting.YELLOW;
+            minecraft.gui.setOverlayMessage(Component.translatable(statusKey)
+                    .withStyle(color, ChatFormatting.BOLD), false);
+            progressOverlayVisible = true;
             return;
         }
         if (adapter != null && adapter.isReconnecting()) {
@@ -513,6 +555,34 @@ public final class ClientVideoState {
         }
         lastTimeSyncRequestNanos = nowNanos;
         VideoNetwork.CHANNEL.sendToServer(new VideoTimeSyncRequestMessage(nowNanos));
+    }
+
+    private static void maybeReportPlaybackCapability() {
+        if (!playbackAvailabilityKnown || capabilityReported) {
+            return;
+        }
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player == null || minecraft.getConnection() == null) {
+            return;
+        }
+        VideoNetwork.CHANNEL.sendToServer(
+                new VideoClientCapabilityMessage(playbackAvailable));
+        capabilityReported = true;
+        Main.LOGGER.debug("Reported client video playback capability: available={}",
+                playbackAvailable);
+    }
+
+    private static void maybeShowPlaybackUnavailableNotice() {
+        if (!playbackAvailabilityKnown || playbackAvailable || availabilityNoticeShown) {
+            return;
+        }
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player == null) {
+            return;
+        }
+        minecraft.player.displayClientMessage(Component.translatable(
+                "message.video_synchronizer.ffmpeg_unavailable"), false);
+        availabilityNoticeShown = true;
     }
 
     private static void resetTimeSync() {

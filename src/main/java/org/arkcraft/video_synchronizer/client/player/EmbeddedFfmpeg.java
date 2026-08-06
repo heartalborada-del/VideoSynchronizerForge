@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -27,6 +28,9 @@ final class EmbeddedFfmpeg {
     private static final String BUNDLE_ID = "ffmpeg-n7.1.5-12-g1fdbca85aa-lgpl-shared";
     private static final String COMPLETE_MARKER = ".complete";
     private static final String LINK_MANIFEST = ".video-synchronizer-links";
+    private static final String CACHE_DIRECTORY_PROPERTY =
+            "video_synchronizer.ffmpegCacheDirectory";
+    private static final long EXECUTABLE_CHECK_TIMEOUT_SECONDS = 10L;
 
     private static volatile Executables resolvedExecutables;
 
@@ -41,6 +45,12 @@ final class EmbeddedFfmpeg {
         return executables().ffprobe();
     }
 
+    static void verifyExecutables() throws IOException {
+        Executables current = executables();
+        verifyExecutable("ffmpeg", current.ffmpeg());
+        verifyExecutable("ffprobe", current.ffprobe());
+    }
+
     static ProcessBuilder processBuilder(List<String> command) {
         Executables current = executables();
         ProcessBuilder builder = new ProcessBuilder(command);
@@ -53,6 +63,35 @@ final class EmbeddedFfmpeg {
             builder.environment().put("LD_LIBRARY_PATH", libraryPath);
         }
         return builder;
+    }
+
+    private static void verifyExecutable(String name, String executable) throws IOException {
+        Process process = processBuilder(List.of(executable, "-version"))
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start();
+        boolean completed;
+        try {
+            completed = process.waitFor(EXECUTABLE_CHECK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException exception) {
+            terminateProcessTree(process);
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while checking " + name, exception);
+        }
+        if (!completed) {
+            terminateProcessTree(process);
+            throw new IOException(name + " did not respond within "
+                    + EXECUTABLE_CHECK_TIMEOUT_SECONDS + " seconds");
+        }
+        if (process.exitValue() != 0) {
+            throw new IOException(name + " executable check exited with status "
+                    + process.exitValue());
+        }
+    }
+
+    private static void terminateProcessTree(Process process) {
+        process.descendants().forEach(ProcessHandle::destroyForcibly);
+        process.destroyForcibly();
     }
 
     private static Executables executables() {
@@ -103,37 +142,149 @@ final class EmbeddedFfmpeg {
 
     private static Path installEmbeddedBundle(Platform platform, String resource)
             throws IOException {
-        Path cacheRoot = Minecraft.getInstance().gameDirectory.toPath()
-                .resolve("video_synchronizer").resolve("ffmpeg");
+        Path cacheRoot = persistentCacheRoot();
+        Main.LOGGER.info("Using embedded FFmpeg persistent cache directory: {}", cacheRoot);
         Files.createDirectories(cacheRoot);
         Path installDirectory = cacheRoot.resolve(BUNDLE_ID).resolve(platform.id());
         Path lockPath = cacheRoot.resolve(platform.id() + ".lock");
         try (FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE); FileLock ignored = channel.lock()) {
-            if (isComplete(installDirectory, platform)) {
-                return installDirectory;
+            if (!isStoredBundleComplete(installDirectory, platform)) {
+                deleteTree(installDirectory);
+                Path stagingDirectory = Files.createTempDirectory(cacheRoot, BUNDLE_ID + ".tmp-");
+                try {
+                    extractBundle(resource, platform, stagingDirectory, !isAndroid());
+                    Files.writeString(stagingDirectory.resolve(COMPLETE_MARKER), BUNDLE_ID,
+                            StandardOpenOption.CREATE_NEW);
+                    Files.createDirectories(installDirectory.getParent());
+                    try {
+                        Files.move(stagingDirectory, installDirectory,
+                                StandardCopyOption.ATOMIC_MOVE);
+                    } catch (AtomicMoveNotSupportedException exception) {
+                        Files.move(stagingDirectory, installDirectory);
+                    }
+                } finally {
+                    deleteTree(stagingDirectory);
+                }
             }
-            deleteTree(installDirectory);
+        }
+        if (!isStoredBundleComplete(installDirectory, platform)) {
+            throw new IOException("Embedded FFmpeg extraction did not produce the required files");
+        }
+        return isAndroid() ? prepareAndroidRuntimeBundle(installDirectory, platform)
+                : installDirectory;
+    }
+
+    private static Path prepareAndroidRuntimeBundle(Path storedDirectory, Platform platform)
+            throws IOException {
+        Path cacheRoot = runtimeCacheRoot();
+        Files.createDirectories(cacheRoot);
+        Path runtimeDirectory = cacheRoot.resolve(BUNDLE_ID).resolve(platform.id());
+        Path lockPath = cacheRoot.resolve(platform.id() + ".lock");
+        try (FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE); FileLock ignored = channel.lock()) {
+            if (isComplete(runtimeDirectory, platform)) {
+                return runtimeDirectory;
+            }
+            deleteTree(runtimeDirectory);
             Path stagingDirectory = Files.createTempDirectory(cacheRoot, BUNDLE_ID + ".tmp-");
             try {
-                extractBundle(resource, platform, stagingDirectory);
+                copyBundle(storedDirectory, stagingDirectory);
+                makeExecutable(executablePath(stagingDirectory, platform, "ffmpeg"));
+                makeExecutable(executablePath(stagingDirectory, platform, "ffprobe"));
                 Files.writeString(stagingDirectory.resolve(COMPLETE_MARKER), BUNDLE_ID,
                         StandardOpenOption.CREATE_NEW);
-                Files.createDirectories(installDirectory.getParent());
+                Files.createDirectories(runtimeDirectory.getParent());
                 try {
-                    Files.move(stagingDirectory, installDirectory,
+                    Files.move(stagingDirectory, runtimeDirectory,
                             StandardCopyOption.ATOMIC_MOVE);
                 } catch (AtomicMoveNotSupportedException exception) {
-                    Files.move(stagingDirectory, installDirectory);
+                    Files.move(stagingDirectory, runtimeDirectory);
                 }
             } finally {
                 deleteTree(stagingDirectory);
             }
         }
-        if (!isComplete(installDirectory, platform)) {
-            throw new IOException("Embedded FFmpeg extraction did not produce the required files");
+        if (!isComplete(runtimeDirectory, platform)) {
+            throw new IOException("Android runtime FFmpeg copy is not executable");
         }
-        return installDirectory;
+        return runtimeDirectory;
+    }
+
+    private static Path persistentCacheRoot() {
+        return Minecraft.getInstance().gameDirectory.toPath()
+                .resolve("video_synchronizer").resolve("ffmpeg");
+    }
+
+    private static Path runtimeCacheRoot() throws IOException {
+        String configured = System.getProperty(CACHE_DIRECTORY_PROPERTY);
+        if (configured != null && !configured.isBlank()) {
+            Path directory = Path.of(configured).toAbsolutePath().normalize();
+            validateAndroidCacheDirectory(directory);
+            Main.LOGGER.info("Using configured embedded FFmpeg runtime directory: {}", directory);
+            return directory;
+        }
+
+        if (isAndroid()) {
+            String temporaryDirectory = System.getProperty("java.io.tmpdir");
+            if (temporaryDirectory == null || temporaryDirectory.isBlank()) {
+                throw new IOException("The Android launcher did not provide an internal "
+                        + "temporary directory; set -D" + CACHE_DIRECTORY_PROPERTY
+                        + " to an executable internal directory");
+            }
+            Path directory = Path.of(temporaryDirectory).toAbsolutePath().normalize()
+                    .resolve("video_synchronizer").resolve("ffmpeg");
+            validateAndroidCacheDirectory(directory);
+            Main.LOGGER.info("Using Android launcher internal directory for embedded FFmpeg: {}",
+                    directory);
+            return directory;
+        }
+
+        return Minecraft.getInstance().gameDirectory.toPath()
+                .resolve("video_synchronizer").resolve("ffmpeg");
+    }
+
+    private static void copyBundle(Path source, Path destination) throws IOException {
+        try (Stream<Path> paths = Files.walk(source)) {
+            for (Path path : paths.sorted().toList()) {
+                Path relative = source.relativize(path);
+                if (relative.getNameCount() == 0
+                        || COMPLETE_MARKER.equals(relative.toString())) {
+                    continue;
+                }
+                Path target = destination.resolve(relative);
+                if (Files.isDirectory(path)) {
+                    Files.createDirectories(target);
+                } else {
+                    Files.createDirectories(target.getParent());
+                    Files.copy(path, target, StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
+    }
+
+    private static void validateAndroidCacheDirectory(Path directory) throws IOException {
+        if (isAndroid() && isAndroidSharedStorage(directory)) {
+            throw new IOException("Refusing to extract embedded FFmpeg to Android shared "
+                    + "storage because it does not support executable files: " + directory);
+        }
+    }
+
+    private static boolean isAndroidSharedStorage(Path directory) {
+        String normalized = directory.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
+        return normalized.equals("/sdcard") || normalized.startsWith("/sdcard/")
+                || normalized.equals("/storage/emulated")
+                || normalized.startsWith("/storage/emulated/")
+                || normalized.equals("/mnt/sdcard") || normalized.startsWith("/mnt/sdcard/");
+    }
+
+    private static boolean isAndroid() {
+        return System.getProperty("os.version", "").toLowerCase(Locale.ROOT)
+                .contains("android")
+                || System.getProperty("java.runtime.name", "").toLowerCase(Locale.ROOT)
+                .contains("android")
+                || System.getProperty("java.vm.name", "").toLowerCase(Locale.ROOT)
+                .contains("dalvik");
     }
 
     private static boolean isComplete(Path directory, Platform platform) {
@@ -151,7 +302,21 @@ final class EmbeddedFfmpeg {
         }
     }
 
-    private static void extractBundle(String resource, Platform platform, Path destination)
+    private static boolean isStoredBundleComplete(Path directory, Platform platform) {
+        Path ffmpeg = executablePath(directory, platform, "ffmpeg");
+        Path ffprobe = executablePath(directory, platform, "ffprobe");
+        if (!Files.isRegularFile(ffmpeg) || !Files.isRegularFile(ffprobe)) {
+            return false;
+        }
+        try {
+            return BUNDLE_ID.equals(Files.readString(directory.resolve(COMPLETE_MARKER)));
+        } catch (IOException exception) {
+            return false;
+        }
+    }
+
+    private static void extractBundle(String resource, Platform platform, Path destination,
+                                      boolean makeExecutables)
             throws IOException {
         Map<String, String> symbolicLinks = new LinkedHashMap<>();
         int extractedFiles = 0;
@@ -192,7 +357,7 @@ final class EmbeddedFfmpeg {
                 || !Files.isRegularFile(ffprobe)) {
             throw new IOException("FFmpeg archive is missing required executables");
         }
-        if (!platform.windows()) {
+        if (!platform.windows() && makeExecutables) {
             makeExecutable(ffmpeg);
             makeExecutable(ffprobe);
         }

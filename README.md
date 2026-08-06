@@ -62,6 +62,8 @@ status commands are available to every player.
 
 - New sessions and seeks wait for most online clients to become ready. Reconnecting and
   late-joining players automatically synchronize to the active session.
+- Clients validate both `ffmpeg` and `ffprobe` at startup. Clients that fail validation
+  cannot play video and are excluded from preload thresholds and clock consensus.
 - If audio or video stalls, both streams restart from the same synchronized position.
 - Playback stops automatically at the known media duration. Live streams continue until
   stopped manually.

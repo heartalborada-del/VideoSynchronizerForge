@@ -35,10 +35,12 @@ import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -67,6 +69,7 @@ public final class ServerVideoSession {
             new HashMap<>();
     private static final Map<UUID, Long> READY_DURATIONS = new HashMap<>();
     private static final Map<UUID, Double> PLAYER_WEIGHTS = new HashMap<>();
+    private static final Set<UUID> PLAYBACK_CAPABLE_PLAYERS = new HashSet<>();
     private static final Map<UUID, ServerBossEvent> STATUS_BOSS_BARS = new HashMap<>();
     private static Session current;
     private static long serverTick;
@@ -117,7 +120,7 @@ public final class ServerVideoSession {
                                        MediaRequestOptions requestOptions,
                                        boolean disableScaling, int videoPipeLanes,
                                        VideoPixelFormat videoPixelFormat) {
-        boolean waitingForClients = server.getPlayerList().getPlayerCount() > 0;
+        boolean waitingForClients = capablePlayerCount(server) > 0;
         current = new Session(UUID.randomUUID().toString(), videoId, videoUrl, audioUrl,
                 requestOptions, disableScaling, videoPipeLanes, 0L, 0L,
                 videoPixelFormat == null ? VideoPixelFormat.RGB24 : videoPixelFormat,
@@ -248,7 +251,7 @@ public final class ServerVideoSession {
         }
         boolean playWhenReady = current.waitingForClients
                 ? current.playWhenReady : current.playing;
-        boolean waitingForClients = server.getPlayerList().getPlayerCount() > 0;
+        boolean waitingForClients = capablePlayerCount(server) > 0;
         current.positionMs = clampToDuration(positionMs);
         current.positionNanos = System.nanoTime();
         current.playWhenReady = playWhenReady;
@@ -340,6 +343,9 @@ public final class ServerVideoSession {
             sendCurrent(player);
             return;
         }
+        if (!PLAYBACK_CAPABLE_PLAYERS.contains(player.getUUID())) {
+            return;
+        }
         if (current.waitingForClients) {
             return;
         }
@@ -406,6 +412,9 @@ public final class ServerVideoSession {
         if (!current.waitingForClients) {
             return;
         }
+        if (!PLAYBACK_CAPABLE_PLAYERS.contains(player.getUUID())) {
+            return;
+        }
         long duration = message.durationMs();
         if (duration < 0L || (duration > 0L
                 && (duration < 1_000L || duration > MAX_VIDEO_DURATION_MS))) {
@@ -416,10 +425,35 @@ public final class ServerVideoSession {
         tryBeginPlayback(server);
     }
 
+    public static void acceptClientCapability(MinecraftServer server, ServerPlayer player,
+                                              boolean playbackAvailable) {
+        UUID playerId = player.getUUID();
+        boolean changed;
+        if (playbackAvailable) {
+            changed = PLAYBACK_CAPABLE_PLAYERS.add(playerId);
+        } else {
+            changed = PLAYBACK_CAPABLE_PLAYERS.remove(playerId);
+            REPORTS.remove(playerId);
+            READY_DURATIONS.remove(playerId);
+            JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.remove(playerId);
+        }
+        if (!changed || current == null) {
+            return;
+        }
+        Main.LOGGER.info("Client {} video playback capability: available={}",
+                player.getGameProfile().getName(), playbackAvailable);
+        if (current.waitingForClients) {
+            tryBeginPlayback(server);
+        } else if (playbackAvailable) {
+            JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.put(playerId, 0);
+        }
+    }
+
     public static void acceptLocalPause(ServerPlayer player, VideoLocalPauseMessage message) {
         MinecraftServer server = player.getServer();
         if (server == null || current == null
                 || !current.sessionId.equals(message.sessionId())
+                || !PLAYBACK_CAPABLE_PLAYERS.contains(player.getUUID())
                 || server.isDedicatedServer() || server.isPublished()
                 || server.getPlayerList().getPlayerCount() != 1
                 || !server.isSingleplayerOwner(player.getGameProfile())) {
@@ -487,6 +521,7 @@ public final class ServerVideoSession {
         REPORTS.remove(playerId);
         JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.remove(playerId);
         READY_DURATIONS.remove(playerId);
+        PLAYBACK_CAPABLE_PLAYERS.remove(playerId);
         ServerBossEvent bossBar = STATUS_BOSS_BARS.remove(playerId);
         if (bossBar != null) {
             bossBar.removeAllPlayers();
@@ -535,6 +570,7 @@ public final class ServerVideoSession {
         JOIN_REPORT_CONFIRMATIONS_BY_PLAYER.clear();
         READY_DURATIONS.clear();
         PLAYER_WEIGHTS.clear();
+        PLAYBACK_CAPABLE_PLAYERS.clear();
         STATUS_BOSS_BARS.values().forEach(ServerBossEvent::removeAllPlayers);
         STATUS_BOSS_BARS.clear();
         serverTick = 0L;
@@ -588,14 +624,17 @@ public final class ServerVideoSession {
                 "command.video_synchronizer.status.target", targetDescription()));
         result = result.copy().append("\n").append(Component.translatable(
                 "command.video_synchronizer.status.clients", REPORTS.size(),
-                server.getPlayerList().getPlayerCount(), rejectedReports));
+                capablePlayerCount(server), rejectedReports));
 
         if (current.waitingForClients) {
-            int required = requiredReadyCount(server.getPlayerList().getPlayerCount());
+            int required = requiredReadyCount(capablePlayerCount(server));
             Component localReadiness;
             if (viewer == null) {
                 localReadiness = Component.translatable(
                         "command.video_synchronizer.status.not_applicable");
+            } else if (!PLAYBACK_CAPABLE_PLAYERS.contains(viewer.getUUID())) {
+                localReadiness = Component.translatable(
+                        "command.video_synchronizer.status.unavailable");
             } else {
                 localReadiness = Component.translatable(
                         READY_DURATIONS.containsKey(viewer.getUUID())
@@ -608,6 +647,11 @@ public final class ServerVideoSession {
         }
         if (viewer == null) {
             return result;
+        }
+        if (!PLAYBACK_CAPABLE_PLAYERS.contains(viewer.getUUID())) {
+            return result.copy().append("\n").append(Component.translatable(
+                    "command.video_synchronizer.status.local_unavailable")
+                    .withStyle(ChatFormatting.RED));
         }
         PlayerReport report = REPORTS.get(viewer.getUUID());
         if (report == null) {
@@ -652,8 +696,14 @@ public final class ServerVideoSession {
             return;
         }
         if (current.waitingForClients) {
-            int onlinePlayers = player.getServer().getPlayerList().getPlayerCount();
-            int required = requiredReadyCount(onlinePlayers);
+            int required = requiredReadyCount(capablePlayerCount(player.getServer()));
+            if (!PLAYBACK_CAPABLE_PLAYERS.contains(player.getUUID())) {
+                bossBar.setName(Component.translatable(
+                        "command.video_synchronizer.bossbar.unavailable"));
+                bossBar.setColor(BossEvent.BossBarColor.RED);
+                bossBar.setProgress(0.0F);
+                return;
+            }
             boolean localReady = READY_DURATIONS.containsKey(player.getUUID());
             bossBar.setName(Component.translatable(
                     "command.video_synchronizer.bossbar.waiting", READY_DURATIONS.size(),
@@ -663,6 +713,13 @@ public final class ServerVideoSession {
             bossBar.setColor(BossEvent.BossBarColor.PURPLE);
             bossBar.setProgress(required == 0 ? 1.0F
                     : Math.min(1.0F, READY_DURATIONS.size() / (float) required));
+            return;
+        }
+        if (!PLAYBACK_CAPABLE_PLAYERS.contains(player.getUUID())) {
+            bossBar.setName(Component.translatable(
+                    "command.video_synchronizer.bossbar.unavailable"));
+            bossBar.setColor(BossEvent.BossBarColor.RED);
+            bossBar.setProgress(0.0F);
             return;
         }
         PlayerReport report = REPORTS.get(player.getUUID());
@@ -854,8 +911,7 @@ public final class ServerVideoSession {
         if (current == null || !current.waitingForClients) {
             return false;
         }
-        int onlinePlayers = server.getPlayerList().getPlayerCount();
-        int requiredPlayers = requiredReadyCount(onlinePlayers);
+        int requiredPlayers = requiredReadyCount(capablePlayerCount(server));
         if (READY_DURATIONS.size() < requiredPlayers) {
             return false;
         }
@@ -873,10 +929,20 @@ public final class ServerVideoSession {
         return true;
     }
 
-    private static int requiredReadyCount(int onlinePlayers) {
+    private static int requiredReadyCount(int capablePlayers) {
         // Round up so small player counts never start below the requested 80%.
-        return (onlinePlayers * READY_THRESHOLD_NUMERATOR
+        return (capablePlayers * READY_THRESHOLD_NUMERATOR
                 + READY_THRESHOLD_DENOMINATOR - 1) / READY_THRESHOLD_DENOMINATOR;
+    }
+
+    private static int capablePlayerCount(MinecraftServer server) {
+        int count = 0;
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (PLAYBACK_CAPABLE_PLAYERS.contains(player.getUUID())) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private static long medianReadyDuration() {

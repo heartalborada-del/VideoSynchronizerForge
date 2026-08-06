@@ -8,7 +8,7 @@ import org.arkcraft.video_synchronizer.Main;
 
 /** The single protocol used by both sides of a video session. */
 public final class VideoNetwork {
-    private static final String PROTOCOL = "16";
+    private static final String PROTOCOL = "17";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(Main.MODID, "sync"),
             () -> PROTOCOL,
@@ -38,6 +38,11 @@ public final class VideoNetwork {
         CHANNEL.messageBuilder(VideoReadyMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
                 .encoder(VideoReadyMessage::encode).decoder(VideoReadyMessage::decode)
                 .consumerMainThread(VideoReadyMessage::handle).add();
+        CHANNEL.messageBuilder(VideoClientCapabilityMessage.class, nextId++,
+                        NetworkDirection.PLAY_TO_SERVER)
+                .encoder(VideoClientCapabilityMessage::encode)
+                .decoder(VideoClientCapabilityMessage::decode)
+                .consumerMainThread(VideoClientCapabilityMessage::handle).add();
         CHANNEL.messageBuilder(VideoHttpErrorMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
                 .encoder(VideoHttpErrorMessage::encode).decoder(VideoHttpErrorMessage::decode)
                 .consumerMainThread(VideoHttpErrorMessage::handle).add();
