@@ -721,15 +721,15 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     }
 
     private synchronized boolean requestCoordinatedRecovery(long sessionGeneration,
-                                                            String stalledStream) {
+                                                            String recoveryReason) {
         if (generation.get() != sessionGeneration || !clockStarted || !playing
                 || clientPaused || preloading || requestedSeekMs.get() >= 0L
                 || pendingSeekPreparation >= 0L || activatedSeekPreparation >= 0L) {
             return false;
         }
         long recoveryPositionMs = positionMs();
-        Main.LOGGER.warn("Synchronized {} stalled; restarting audio and video together at {} ms",
-                stalledStream, recoveryPositionMs);
+        Main.LOGGER.warn("Synchronized recovery requested for {}; restarting audio and video "
+                        + "together at {} ms", recoveryReason, recoveryPositionMs);
         videoReconnecting = true;
         audioPlayback.markReconnecting();
         cancelPreparedSeek();
@@ -1001,20 +1001,20 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             framePosition, discardUntilMs);
                 }
                 long catchUpNow = System.nanoTime();
+                long videoBehindMs = playbackPosition - framePosition;
                 if (clockStarted && playing && !clientPaused && !preloading
                         && videoDiscardUntilMs.get() < 0L
-                        && playbackPosition - framePosition >= VIDEO_CATCH_UP_THRESHOLD_MS
+                        && videoBehindMs >= VIDEO_CATCH_UP_THRESHOLD_MS
                         && catchUpNow - lastCatchUpSeekNanos
                         >= VIDEO_CATCH_UP_COOLDOWN_NANOS
-                        && requestedSeekMs.compareAndSet(-1L, playbackPosition)) {
+                        && requestCoordinatedRecovery(sessionGeneration,
+                                "video decoder fell " + videoBehindMs
+                                + " ms behind the synchronized clock")) {
                     lastCatchUpSeekNanos = catchUpNow;
                     frameBuffer.release(
                             new VideoFrameBuffer.DecodedFrame(
                                     outputDimensions.width, outputDimensions.height,
                                     framePosition, pixelFormat, frameData));
-                    Main.LOGGER.warn("Video decoder fell {} ms behind the synchronized clock; "
-                                    + "restarting at {} ms",
-                            playbackPosition - framePosition, playbackPosition);
                     return DecodeResult.SEEK_REQUESTED;
                 }
 

@@ -69,6 +69,8 @@
   "command.video_synchronizer.bossbar.playback": "Local %s / %s | Drift %sms | %s | Report age %sms",
   "command.video_synchronizer.bossbar.enabled": "Local video status Boss Bar enabled",
   "command.video_synchronizer.bossbar.disabled": "Local video status Boss Bar disabled",
+  "command.video_synchronizer.sync.none": "No active video session to synchronize",
+  "command.video_synchronizer.sync.requested": "Stopped local playback; synchronizing %s session(s) with the server",
   "command.video_synchronizer.status.header": "=== Video Status ===",
   "command.video_synchronizer.status.none": "No active video session",
   "command.video_synchronizer.status.session": "Video: %s | Session: %s | State: %s",

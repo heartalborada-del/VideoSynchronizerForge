@@ -59,6 +59,7 @@ Managers keeps those screen sessions independent.
 /video pause
 /video resume
 /video seek <milliseconds>
+/video sync
 /video weight <player> <0.01-100>
 /video status
 /video status bossbar
@@ -72,6 +73,8 @@ Managers keeps those screen sessions independent.
 - Clients validate both `ffmpeg` and `ffprobe` at startup. Clients that fail validation
   cannot play video and are excluded from preload thresholds and clock consensus.
 - If audio or video stalls, both streams restart from the same synchronized position.
+- `/video sync` is a client-only command that stops local video and audio, requests the
+  current server-authoritative positions, and restarts local playback from those positions.
 - Audio is positioned at the center of its screen. Each Video Manager stores its own cutoff
   range, which defaults to 48 blocks, and can instead use fixed-range or global audio.
 - In positional fading mode, clients outside the configured range do not start FFmpeg and

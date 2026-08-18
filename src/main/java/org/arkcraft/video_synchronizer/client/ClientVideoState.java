@@ -111,6 +111,7 @@ public final class ClientVideoState {
         session.lastReportNanos = 0L;
         session.clearPendingCorrection();
         session.initialized = true;
+        session.awaitingForcedResync = false;
         Main.LOGGER.debug("Accepted video session: session={}, videoId={}, position={} ms, "
                         + "duration={} ms, playing={}, waitingForClients={}, revision={}, "
                         + "sameSession={}", session.sessionId, session.videoId, session.positionMs,
@@ -262,7 +263,8 @@ public final class ClientVideoState {
     }
 
     private static void updateSessionLoading(SessionState session) {
-        boolean loadRequired = playbackAvailable && session.initialized && shouldLoad(session);
+        boolean loadRequired = playbackAvailable && session.initialized
+                && !session.awaitingForcedResync && shouldLoad(session);
         if (!loadRequired) {
             if (session.adapter != null) {
                 session.adapter.dispose();
@@ -350,6 +352,26 @@ public final class ClientVideoState {
                 VideoNetwork.CHANNEL.sendToServer(new VideoResyncMessage(sessionId)));
     }
 
+    public static int forceResync() {
+        if (SESSIONS.isEmpty()) {
+            return 0;
+        }
+        SESSIONS.values().forEach(session -> {
+            session.awaitingForcedResync = true;
+            session.readinessReported = false;
+            session.clearPendingCorrection();
+            if (session.adapter != null) {
+                session.adapter.dispose();
+                session.adapter = null;
+            }
+        });
+        String sessionId = SESSIONS.keySet().iterator().next();
+        VideoNetwork.CHANNEL.sendToServer(new VideoResyncMessage(sessionId));
+        Main.LOGGER.info("Stopped local playback and requested forced synchronization for {} session(s)",
+                SESSIONS.size());
+        return SESSIONS.size();
+    }
+
     public static void reportPlaybackError(String sessionId,
                                            VideoPlaybackErrorMessage.Reason reason,
                                            int statusCode) {
@@ -430,6 +452,13 @@ public final class ClientVideoState {
             minecraft.gui.setOverlayMessage(Component.translatable(statusKey)
                     .withStyle(playbackAvailabilityKnown ? ChatFormatting.RED : ChatFormatting.YELLOW,
                             ChatFormatting.BOLD), false);
+            progressOverlayVisible = true;
+            return;
+        }
+        if (session.awaitingForcedResync) {
+            minecraft.gui.setOverlayMessage(Component.translatable(
+                    "overlay.video_synchronizer.progress_syncing")
+                    .withStyle(ChatFormatting.YELLOW, ChatFormatting.BOLD), false);
             progressOverlayVisible = true;
             return;
         }
@@ -609,6 +638,7 @@ public final class ClientVideoState {
         private int ticksSinceReport;
         private long lastReportNanos;
         private boolean initialized;
+        private boolean awaitingForcedResync;
         private int pendingCorrectionDirection;
         private int pendingCorrectionCount;
         private long progressSwitchUntilNanos;

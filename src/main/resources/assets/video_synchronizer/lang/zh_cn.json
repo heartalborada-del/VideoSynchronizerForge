@@ -69,6 +69,8 @@
   "command.video_synchronizer.bossbar.playback": "本地 %s / %s | 偏差 %s毫秒 | %s | 上报延迟 %s毫秒",
   "command.video_synchronizer.bossbar.enabled": "已启用本地视频状态 Boss Bar",
   "command.video_synchronizer.bossbar.disabled": "已关闭本地视频状态 Boss Bar",
+  "command.video_synchronizer.sync.none": "当前没有可同步的视频会话",
+  "command.video_synchronizer.sync.requested": "已停止本地播放，正在与服务器同步 %s 个会话",
   "command.video_synchronizer.status.header": "=== 视频播放状态 ===",
   "command.video_synchronizer.status.none": "当前没有活动的视频会话",
   "command.video_synchronizer.status.session": "视频：%s | 会话：%s | 状态：%s",
