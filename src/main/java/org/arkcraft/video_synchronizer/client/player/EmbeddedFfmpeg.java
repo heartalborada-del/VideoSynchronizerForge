@@ -25,7 +25,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 final class EmbeddedFfmpeg {
-    private static final String BUNDLE_ID = "ffmpeg-n7.1.5-12-g1fdbca85aa-lgpl-shared";
+    private static final String BUNDLE_ID_FILE = "bundle.id";
     private static final String COMPLETE_MARKER = ".complete";
     private static final String LINK_MANIFEST = ".video-synchronizer-links";
     private static final String CACHE_DIRECTORY_PROPERTY =
@@ -142,19 +142,21 @@ final class EmbeddedFfmpeg {
 
     private static Path installEmbeddedBundle(Platform platform, String resource)
             throws IOException {
+        String bundleId = readBundleId(platform);
         Path cacheRoot = persistentCacheRoot();
         Main.LOGGER.info("Using embedded FFmpeg persistent cache directory: {}", cacheRoot);
         Files.createDirectories(cacheRoot);
-        Path installDirectory = cacheRoot.resolve(BUNDLE_ID).resolve(platform.id());
+        Path installDirectory = cacheRoot.resolve(bundleId).resolve(platform.id());
         Path lockPath = cacheRoot.resolve(platform.id() + ".lock");
         try (FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE); FileLock ignored = channel.lock()) {
-            if (!isStoredBundleComplete(installDirectory, platform)) {
+            if (!isStoredBundleComplete(installDirectory, platform, bundleId)) {
                 deleteTree(installDirectory);
-                Path stagingDirectory = Files.createTempDirectory(cacheRoot, BUNDLE_ID + ".tmp-");
+                Path stagingDirectory = Files.createTempDirectory(cacheRoot,
+                        bundleId + ".tmp-");
                 try {
                     extractBundle(resource, platform, stagingDirectory, !isAndroid());
-                    Files.writeString(stagingDirectory.resolve(COMPLETE_MARKER), BUNDLE_ID,
+                    Files.writeString(stagingDirectory.resolve(COMPLETE_MARKER), bundleId,
                             StandardOpenOption.CREATE_NEW);
                     Files.createDirectories(installDirectory.getParent());
                     try {
@@ -168,31 +170,32 @@ final class EmbeddedFfmpeg {
                 }
             }
         }
-        if (!isStoredBundleComplete(installDirectory, platform)) {
+        if (!isStoredBundleComplete(installDirectory, platform, bundleId)) {
             throw new IOException("Embedded FFmpeg extraction did not produce the required files");
         }
-        return isAndroid() ? prepareAndroidRuntimeBundle(installDirectory, platform)
+        return isAndroid() ? prepareAndroidRuntimeBundle(installDirectory, platform, bundleId)
                 : installDirectory;
     }
 
-    private static Path prepareAndroidRuntimeBundle(Path storedDirectory, Platform platform)
-            throws IOException {
+    private static Path prepareAndroidRuntimeBundle(Path storedDirectory, Platform platform,
+                                                    String bundleId) throws IOException {
         Path cacheRoot = runtimeCacheRoot();
         Files.createDirectories(cacheRoot);
-        Path runtimeDirectory = cacheRoot.resolve(BUNDLE_ID).resolve(platform.id());
+        Path runtimeDirectory = cacheRoot.resolve(bundleId).resolve(platform.id());
         Path lockPath = cacheRoot.resolve(platform.id() + ".lock");
         try (FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE); FileLock ignored = channel.lock()) {
-            if (isComplete(runtimeDirectory, platform)) {
+            if (isComplete(runtimeDirectory, platform, bundleId)) {
                 return runtimeDirectory;
             }
             deleteTree(runtimeDirectory);
-            Path stagingDirectory = Files.createTempDirectory(cacheRoot, BUNDLE_ID + ".tmp-");
+            Path stagingDirectory = Files.createTempDirectory(cacheRoot,
+                    bundleId + ".tmp-");
             try {
                 copyBundle(storedDirectory, stagingDirectory);
                 makeExecutable(executablePath(stagingDirectory, platform, "ffmpeg"));
                 makeExecutable(executablePath(stagingDirectory, platform, "ffprobe"));
-                Files.writeString(stagingDirectory.resolve(COMPLETE_MARKER), BUNDLE_ID,
+                Files.writeString(stagingDirectory.resolve(COMPLETE_MARKER), bundleId,
                         StandardOpenOption.CREATE_NEW);
                 Files.createDirectories(runtimeDirectory.getParent());
                 try {
@@ -205,7 +208,7 @@ final class EmbeddedFfmpeg {
                 deleteTree(stagingDirectory);
             }
         }
-        if (!isComplete(runtimeDirectory, platform)) {
+        if (!isComplete(runtimeDirectory, platform, bundleId)) {
             throw new IOException("Android runtime FFmpeg copy is not executable");
         }
         return runtimeDirectory;
@@ -287,7 +290,7 @@ final class EmbeddedFfmpeg {
                 .contains("dalvik");
     }
 
-    private static boolean isComplete(Path directory, Platform platform) {
+    private static boolean isComplete(Path directory, Platform platform, String bundleId) {
         Path ffmpeg = executablePath(directory, platform, "ffmpeg");
         Path ffprobe = executablePath(directory, platform, "ffprobe");
         if (!Files.isRegularFile(ffmpeg) || !Files.isRegularFile(ffprobe)
@@ -296,20 +299,21 @@ final class EmbeddedFfmpeg {
             return false;
         }
         try {
-            return BUNDLE_ID.equals(Files.readString(directory.resolve(COMPLETE_MARKER)));
+            return bundleId.equals(Files.readString(directory.resolve(COMPLETE_MARKER)));
         } catch (IOException exception) {
             return false;
         }
     }
 
-    private static boolean isStoredBundleComplete(Path directory, Platform platform) {
+    private static boolean isStoredBundleComplete(Path directory, Platform platform,
+                                                  String bundleId) {
         Path ffmpeg = executablePath(directory, platform, "ffmpeg");
         Path ffprobe = executablePath(directory, platform, "ffprobe");
         if (!Files.isRegularFile(ffmpeg) || !Files.isRegularFile(ffprobe)) {
             return false;
         }
         try {
-            return BUNDLE_ID.equals(Files.readString(directory.resolve(COMPLETE_MARKER)));
+            return bundleId.equals(Files.readString(directory.resolve(COMPLETE_MARKER)));
         } catch (IOException exception) {
             return false;
         }
@@ -438,6 +442,20 @@ final class EmbeddedFfmpeg {
 
     private static String resourcePath(Platform platform) {
         return "/META-INF/ffmpeg/" + platform.id() + "/ffmpeg.zip";
+    }
+
+    private static String readBundleId(Platform platform) throws IOException {
+        String resource = "/META-INF/ffmpeg/" + platform.id() + "/" + BUNDLE_ID_FILE;
+        try (InputStream input = EmbeddedFfmpeg.class.getResourceAsStream(resource)) {
+            if (input == null) {
+                throw new IOException("Embedded FFmpeg bundle ID is missing: " + resource);
+            }
+            String bundleId = new String(input.readAllBytes(), StandardCharsets.UTF_8).trim();
+            if (!bundleId.matches("[A-Za-z0-9][A-Za-z0-9._-]{0,127}")) {
+                throw new IOException("Embedded FFmpeg bundle ID is invalid");
+            }
+            return bundleId;
+        }
     }
 
     private static boolean resourceExists(String resource) {
