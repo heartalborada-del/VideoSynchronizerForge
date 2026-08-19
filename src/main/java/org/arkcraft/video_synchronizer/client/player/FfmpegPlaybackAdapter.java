@@ -69,7 +69,14 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static final long DEBUG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10L);
     private static final int PROBE_TIMEOUT_SECONDS = positiveIntegerProperty(
             "video_synchronizer.probeTimeoutSeconds", 60);
-    private static final int INPUT_THREAD_QUEUE_PACKETS = 4_096;
+    private static final int FAST_PROBE_TIMEOUT_SECONDS = Math.min(PROBE_TIMEOUT_SECONDS,
+            positiveIntegerProperty("video_synchronizer.fastProbeTimeoutSeconds", 10));
+    private static final int FAST_PROBE_SIZE_BYTES = positiveIntegerProperty(
+            "video_synchronizer.fastProbeSizeBytes", 5 * 1024 * 1024);
+    private static final int FAST_ANALYZE_DURATION_US = positiveIntegerProperty(
+            "video_synchronizer.fastAnalyzeDurationUs", 5_000_000);
+    private static final int INPUT_THREAD_QUEUE_PACKETS = positiveIntegerProperty(
+            "video_synchronizer.inputThreadQueuePackets", 512);
     private static final String NETWORK_TIMEOUT_US = "15000000";
     private static final String HTTP_SHORT_SEEK_SIZE = "1048576";
     private static final int MAX_FFMPEG_ERROR_LENGTH = 8_192;
@@ -82,6 +89,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static final int AUDIO_BUFFER_FRAMES = AUDIO_SAMPLE_RATE / 10;
     private static final int AUDIO_READ_CANCELLED = -1;
     private static final int AUDIO_READ_STALLED = -2;
+    private static final int HTTP_FORBIDDEN_STATUS = 403;
+    private static final int MAX_HTTP_FORBIDDEN_RETRY_ATTEMPTS = 5;
     private static final int AUDIO_MAX_RESTART_ATTEMPTS = 5;
     private static final long STREAM_RECONNECT_INITIAL_DELAY_MS = 250L;
     private static final long STREAM_RECONNECT_MAX_DELAY_MS = 4_000L;
@@ -610,6 +619,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     System.getProperty("video_synchronizer.ffmpegCudaScale", "false"));
             PreparedVideoDecoder preparedDecoder = null;
             int reconnectAttempts = 0;
+            int forbiddenRetryAttempts = 0;
 
             while (generation.get() == sessionGeneration) {
                 DecodeResult result;
@@ -669,6 +679,19 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         continue;
                     }
                 }
+                if (result == DecodeResult.HTTP_FORBIDDEN) {
+                    videoReconnecting = true;
+                    if (!shouldReconnectVideo(sessionGeneration)
+                            || !waitForHttpForbiddenRetry(sessionGeneration,
+                            forbiddenRetryAttempts, "video decoder")) {
+                        reportHttpError(sessionGeneration, HTTP_FORBIDDEN_STATUS);
+                        break;
+                    }
+                    forbiddenRetryAttempts++;
+                    startPosition = nextVideoStartPosition();
+                    preparedDecoder = null;
+                    continue;
+                }
                 if (result == DecodeResult.HTTP_ERROR) {
                     break;
                 }
@@ -680,6 +703,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     if (lastVideoFrameNanos - decodeAttemptStartedNanos
                             >= VIDEO_RECOVERY_STABLE_NANOS) {
                         reconnectAttempts = 0;
+                        forbiddenRetryAttempts = 0;
                     }
                     if (!shouldReconnectVideo(sessionGeneration)
                             || !prepareVideoReconnect(sessionGeneration, reconnectAttempts,
@@ -1167,6 +1191,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         }
         int httpStatus = findHttpErrorStatus(processErrors);
         if (httpStatus >= 0 && generation.get() == sessionGeneration) {
+            if (httpStatus == HTTP_FORBIDDEN_STATUS) {
+                return DecodeResult.HTTP_FORBIDDEN;
+            }
             reportHttpError(sessionGeneration, httpStatus);
             return DecodeResult.HTTP_ERROR;
         }
@@ -1337,7 +1364,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         processState(candidate), summarizeFfmpegDiagnostics(errorText));
                 int httpStatus = findHttpErrorStatus(errorText);
                 if (httpStatus >= 0 && generation.get() == sessionGeneration) {
-                    reportHttpError(sessionGeneration, httpStatus);
+                    if (httpStatus != HTTP_FORBIDDEN_STATUS) {
+                        reportHttpError(sessionGeneration, httpStatus);
+                    }
                     throw new HttpStatusException(httpStatus);
                 }
             }
@@ -1652,68 +1681,19 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private VideoMetadata probe(String mediaUrl, long sessionGeneration)
             throws IOException, InterruptedException {
         long probeStartNanos = System.nanoTime();
-        Main.LOGGER.debug("Starting media probe: generation={}, executable={}, timeout={} s",
-                sessionGeneration, ffprobeExecutable(), PROBE_TIMEOUT_SECONDS);
-        List<String> command = new ArrayList<>();
-        command.add(ffprobeExecutable());
-        command.add("-v");
-        command.add("error");
-        addNetworkInputOptions(command);
-        command.add("-show_entries");
-        command.add("stream=codec_type,codec_name,profile,pix_fmt,width,height,avg_frame_rate,bit_rate:"
-                + "format=duration,bit_rate,format_name");
-        command.add("-of");
-        command.add("json");
-        command.add(mediaUrl);
-        Process probe = EmbeddedFfmpeg.processBuilder(command)
-                .redirectErrorStream(true).start();
-        Main.LOGGER.debug("Started ffprobe process: pid={}, generation={}",
-                probe.pid(), sessionGeneration);
-        if (!registerProcess(probe, sessionGeneration, false)) {
-            terminateProcessTree(probe);
-            throw new IOException("Video session was cancelled");
-        }
         JsonObject root;
         try {
-            long waitStartNanos = System.nanoTime();
-            long timeoutNanos = TimeUnit.SECONDS.toNanos(PROBE_TIMEOUT_SECONDS);
-            long nextProgressLogNanos = waitStartNanos + TimeUnit.SECONDS.toNanos(5L);
-            while (probe.isAlive()) {
-                if (generation.get() != sessionGeneration) {
-                    throw new IOException("Video session was cancelled during media probing");
-                }
-                long now = System.nanoTime();
-                if (now - waitStartNanos >= timeoutNanos) {
-                    throw new IOException("ffprobe timed out after " + PROBE_TIMEOUT_SECONDS
-                            + " seconds; increase -Dvideo_synchronizer.probeTimeoutSeconds if needed");
-                }
-                if (now >= nextProgressLogNanos) {
-                    Main.LOGGER.debug("Media probe still running: pid={}, generation={}, "
-                                    + "elapsed={} ms, timeout={} s",
-                            probe.pid(), sessionGeneration,
-                            (now - waitStartNanos) / 1_000_000.0D, PROBE_TIMEOUT_SECONDS);
-                    nextProgressLogNanos = now + TimeUnit.SECONDS.toNanos(5L);
-                }
-                probe.waitFor(1L, TimeUnit.SECONDS);
+            root = runVideoProbe(mediaUrl, sessionGeneration, true);
+            if (!hasUsableVideoStream(root)) {
+                throw new FastProbeException("fast probe returned incomplete video metadata");
             }
-            String probeOutput = new String(
-                    probe.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            if (probe.exitValue() != 0) {
-                int httpStatus = findHttpErrorStatus(probeOutput);
-                if (httpStatus >= 0) {
-                    reportHttpError(sessionGeneration, httpStatus);
-                    throw new HttpStatusException(httpStatus);
-                }
-                throw new MediaSourceException(
-                        VideoPlaybackErrorMessage.Reason.VIDEO_UNPLAYABLE,
-                        "ffprobe could not read video metadata");
+        } catch (FastProbeException exception) {
+            if (generation.get() != sessionGeneration) {
+                throw new IOException("Video session was cancelled during media probing");
             }
-            root = JsonParser.parseString(probeOutput).getAsJsonObject();
-        } finally {
-            if (probe.isAlive()) {
-                terminateProcessTree(probe);
-            }
-            clearProcess(probe);
+            Main.LOGGER.debug("Fast media probe was inconclusive ({}); retrying with full "
+                    + "analysis", exception.getMessage());
+            root = runVideoProbe(mediaUrl, sessionGeneration, false);
         }
         if (!root.has("streams") || root.getAsJsonArray("streams").size() == 0) {
             throw new MediaSourceException(VideoPlaybackErrorMessage.Reason.VIDEO_UNPLAYABLE,
@@ -1781,7 +1761,153 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 codecName, profile, pixelFormat, bitRate);
     }
 
+    private JsonObject runVideoProbe(String mediaUrl, long sessionGeneration,
+                                     boolean fastProbe)
+            throws IOException, InterruptedException {
+        int forbiddenRetryAttempts = 0;
+        while (true) {
+            try {
+                return runVideoProbeAttempt(mediaUrl, sessionGeneration, fastProbe);
+            } catch (HttpStatusException exception) {
+                if (exception.statusCode != HTTP_FORBIDDEN_STATUS
+                        || !waitForHttpForbiddenRetry(sessionGeneration,
+                        forbiddenRetryAttempts, fastProbe ? "fast media probe" : "media probe")) {
+                    reportHttpError(sessionGeneration, exception.statusCode);
+                    throw exception;
+                }
+                forbiddenRetryAttempts++;
+            }
+        }
+    }
+
+    private JsonObject runVideoProbeAttempt(String mediaUrl, long sessionGeneration,
+                                            boolean fastProbe)
+            throws IOException, InterruptedException {
+        int timeoutSeconds = fastProbe ? FAST_PROBE_TIMEOUT_SECONDS : PROBE_TIMEOUT_SECONDS;
+        Main.LOGGER.debug("Starting {} media probe: generation={}, executable={}, timeout={} s",
+                fastProbe ? "fast" : "full", sessionGeneration, ffprobeExecutable(),
+                timeoutSeconds);
+        List<String> command = new ArrayList<>();
+        command.add(ffprobeExecutable());
+        command.add("-v");
+        command.add("error");
+        addNetworkInputOptions(command);
+        if (fastProbe) {
+            command.add("-probesize");
+            command.add(Integer.toString(FAST_PROBE_SIZE_BYTES));
+            command.add("-analyzeduration");
+            command.add(Integer.toString(FAST_ANALYZE_DURATION_US));
+        }
+        command.add("-show_entries");
+        command.add("stream=codec_type,codec_name,profile,pix_fmt,width,height,avg_frame_rate,bit_rate:"
+                + "format=duration,bit_rate,format_name");
+        command.add("-of");
+        command.add("json");
+        command.add(mediaUrl);
+        Process probe = EmbeddedFfmpeg.processBuilder(command)
+                .redirectErrorStream(true).start();
+        Main.LOGGER.debug("Started {} ffprobe process: pid={}, generation={}",
+                fastProbe ? "fast" : "full", probe.pid(), sessionGeneration);
+        if (!registerProcess(probe, sessionGeneration, false)) {
+            terminateProcessTree(probe);
+            throw new IOException("Video session was cancelled");
+        }
+        try {
+            long waitStartNanos = System.nanoTime();
+            long timeoutNanos = TimeUnit.SECONDS.toNanos(timeoutSeconds);
+            long nextProgressLogNanos = waitStartNanos + TimeUnit.SECONDS.toNanos(5L);
+            while (probe.isAlive()) {
+                if (generation.get() != sessionGeneration) {
+                    throw new IOException("Video session was cancelled during media probing");
+                }
+                long now = System.nanoTime();
+                if (now - waitStartNanos >= timeoutNanos) {
+                    if (fastProbe) {
+                        throw new FastProbeException("ffprobe timed out after "
+                                + timeoutSeconds + " seconds");
+                    }
+                    throw new IOException("ffprobe timed out after " + timeoutSeconds
+                            + " seconds; increase -Dvideo_synchronizer.probeTimeoutSeconds "
+                            + "if needed");
+                }
+                if (!fastProbe && now >= nextProgressLogNanos) {
+                    Main.LOGGER.debug("Media probe still running: pid={}, generation={}, "
+                                    + "elapsed={} ms, timeout={} s",
+                            probe.pid(), sessionGeneration,
+                            (now - waitStartNanos) / 1_000_000.0D, timeoutSeconds);
+                    nextProgressLogNanos = now + TimeUnit.SECONDS.toNanos(5L);
+                }
+                probe.waitFor(1L, TimeUnit.SECONDS);
+            }
+            String probeOutput = new String(
+                    probe.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            if (probe.exitValue() != 0) {
+                int httpStatus = findHttpErrorStatus(probeOutput);
+                if (httpStatus >= 0) {
+                    throw new HttpStatusException(httpStatus);
+                }
+                if (fastProbe) {
+                    throw new FastProbeException("ffprobe exited with status "
+                            + probe.exitValue());
+                }
+                throw new MediaSourceException(
+                        VideoPlaybackErrorMessage.Reason.VIDEO_UNPLAYABLE,
+                        "ffprobe could not read video metadata");
+            }
+            try {
+                return JsonParser.parseString(probeOutput).getAsJsonObject();
+            } catch (RuntimeException exception) {
+                if (fastProbe) {
+                    throw new FastProbeException("ffprobe returned invalid metadata");
+                }
+                throw new MediaSourceException(
+                        VideoPlaybackErrorMessage.Reason.VIDEO_UNPLAYABLE,
+                        "ffprobe returned invalid video metadata");
+            }
+        } finally {
+            if (probe.isAlive()) {
+                terminateProcessTree(probe);
+            }
+            clearProcess(probe);
+        }
+    }
+
+    private static boolean hasUsableVideoStream(JsonObject root) {
+        if (!root.has("streams") || !root.get("streams").isJsonArray()) {
+            return false;
+        }
+        for (var element : root.getAsJsonArray("streams")) {
+            JsonObject stream = element.getAsJsonObject();
+            if (stream.has("codec_type")
+                    && "video".equals(stream.get("codec_type").getAsString())
+                    && jsonLong(stream, "width", 0L) > 0L
+                    && jsonLong(stream, "height", 0L) > 0L) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void probeAudio(String mediaUrl, long sessionGeneration)
+            throws IOException, InterruptedException {
+        int forbiddenRetryAttempts = 0;
+        while (true) {
+            try {
+                probeAudioAttempt(mediaUrl, sessionGeneration);
+                return;
+            } catch (HttpStatusException exception) {
+                if (exception.statusCode != HTTP_FORBIDDEN_STATUS
+                        || !waitForHttpForbiddenRetry(sessionGeneration,
+                        forbiddenRetryAttempts, "audio probe")) {
+                    reportHttpError(sessionGeneration, exception.statusCode);
+                    throw exception;
+                }
+                forbiddenRetryAttempts++;
+            }
+        }
+    }
+
+    private void probeAudioAttempt(String mediaUrl, long sessionGeneration)
             throws IOException, InterruptedException {
         List<String> command = new ArrayList<>();
         command.add(ffprobeExecutable());
@@ -1816,7 +1942,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             if (probe.exitValue() != 0) {
                 int httpStatus = findHttpErrorStatus(output);
                 if (httpStatus >= 0) {
-                    reportHttpError(sessionGeneration, httpStatus);
                     throw new HttpStatusException(httpStatus);
                 }
                 throw new MediaSourceException(
@@ -1910,6 +2035,27 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private void reportHttpError(long sessionGeneration, int statusCode) {
         reportPlaybackError(sessionGeneration,
                 VideoPlaybackErrorMessage.Reason.HTTP_ERROR, statusCode);
+    }
+
+    private boolean waitForHttpForbiddenRetry(long sessionGeneration, int retryAttempts,
+                                              String operation) throws InterruptedException {
+        if (retryAttempts >= MAX_HTTP_FORBIDDEN_RETRY_ATTEMPTS
+                || generation.get() != sessionGeneration) {
+            Main.LOGGER.warn("FFmpeg {} HTTP 403 retry stopped after {} attempts",
+                    operation, retryAttempts);
+            return false;
+        }
+        long delayMs = Math.min(STREAM_RECONNECT_MAX_DELAY_MS,
+                STREAM_RECONNECT_INITIAL_DELAY_MS << Math.min(retryAttempts, 4));
+        Main.LOGGER.warn("FFmpeg {} received HTTP 403; restarting with the original session URL "
+                        + "in {} ms (attempt {}/{})",
+                operation, delayMs, retryAttempts + 1,
+                MAX_HTTP_FORBIDDEN_RETRY_ATTEMPTS);
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMs);
+        while (generation.get() == sessionGeneration && System.nanoTime() < deadlineNanos) {
+            Thread.sleep(25L);
+        }
+        return generation.get() == sessionGeneration;
     }
 
     private void reportPlaybackError(long sessionGeneration,
@@ -2487,13 +2633,23 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private enum DecodeResult {
         SEEK_REQUESTED,
         HARDWARE_FAILED,
+        HTTP_FORBIDDEN,
         HTTP_ERROR,
         ENDED
     }
 
     private static final class HttpStatusException extends IOException {
+        private final int statusCode;
+
         private HttpStatusException(int statusCode) {
             super("Media server returned HTTP " + statusCode);
+            this.statusCode = statusCode;
+        }
+    }
+
+    private static final class FastProbeException extends IOException {
+        private FastProbeException(String message) {
+            super(message);
         }
     }
 
@@ -2508,6 +2664,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
 
     private enum AudioDecodeResult {
         SEEK_REQUESTED,
+        HTTP_FORBIDDEN,
         HTTP_ERROR,
         ENDED_BEFORE_AUDIO,
         ENDED_AFTER_AUDIO,
@@ -2655,7 +2812,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         }
                         int httpStatus = findHttpErrorStatus(errors.text());
                         if (httpStatus >= 0 && isActive(sessionGeneration)) {
-                            reportHttpError(sessionGeneration, httpStatus);
+                            if (httpStatus != HTTP_FORBIDDEN_STATUS) {
+                                reportHttpError(sessionGeneration, httpStatus);
+                            }
                         }
                     }
                     clearPendingAudioProcess(candidate);
@@ -2731,6 +2890,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             try {
                 long startPosition = nextStartPosition();
                 int restartAttempts = 0;
+                int forbiddenRetryAttempts = 0;
                 while (isActive(sessionGeneration)) {
                     AudioDecodeResult result;
                     try {
@@ -2778,11 +2938,24 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         startPosition = nextStartPosition();
                         continue;
                     }
+                    if (result == AudioDecodeResult.HTTP_FORBIDDEN) {
+                        reconnecting = true;
+                        if (!shouldRestartAudio(sessionGeneration)
+                                || !waitForHttpForbiddenRetry(sessionGeneration,
+                                forbiddenRetryAttempts, "audio decoder")) {
+                            reportHttpError(sessionGeneration, HTTP_FORBIDDEN_STATUS);
+                            break;
+                        }
+                        forbiddenRetryAttempts++;
+                        startPosition = nextStartPosition();
+                        continue;
+                    }
                     if (result == AudioDecodeResult.HTTP_ERROR) {
                         break;
                     }
                     if (result == AudioDecodeResult.ENDED_AFTER_STABLE_AUDIO) {
                         restartAttempts = 0;
+                        forbiddenRetryAttempts = 0;
                     }
                     if (!shouldRestartAudio(sessionGeneration)
                             || !prepareAudioRestart(sessionGeneration,
@@ -3082,6 +3255,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             int httpStatus = findHttpErrorStatus(processErrors);
             if (httpStatus >= 0 && isActive(sessionGeneration)) {
+                if (httpStatus == HTTP_FORBIDDEN_STATUS) {
+                    return AudioDecodeResult.HTTP_FORBIDDEN;
+                }
                 reportHttpError(sessionGeneration, httpStatus);
                 return AudioDecodeResult.HTTP_ERROR;
             }

@@ -73,8 +73,12 @@ Managers keeps those screen sessions independent.
   late-joining players automatically synchronize to the active session.
 - Clients validate both `ffmpeg` and `ffprobe` at startup. Clients that fail validation
   cannot play video and are excluded from preload thresholds and clock consensus.
+- Clients first use a bounded metadata probe to avoid excessive startup buffering for long
+  media, then automatically retry with full analysis when the quick result is incomplete.
 - If audio or video stalls, both streams recover together. On-demand media restarts from
   its synchronized position; live media reconnects at the current live edge.
+- If FFmpeg receives HTTP 403, it retries from the session's original URL up to five times
+  before reporting the HTTP error.
 - `/video sync` is a client-only command that stops local video and audio, requests the
   current server-authoritative positions, and restarts local playback from those positions.
   For live media, it reconnects at the current live edge instead.
