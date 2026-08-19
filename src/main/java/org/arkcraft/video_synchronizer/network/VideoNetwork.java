@@ -8,7 +8,7 @@ import org.arkcraft.video_synchronizer.Main;
 
 /** The single protocol used by both sides of a video session. */
 public final class VideoNetwork {
-    private static final String PROTOCOL = "21";
+    private static final String PROTOCOL = "22";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(Main.MODID, "sync"),
             () -> PROTOCOL,

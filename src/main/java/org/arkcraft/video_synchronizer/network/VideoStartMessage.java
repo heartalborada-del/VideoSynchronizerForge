@@ -10,7 +10,7 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
                                 String requestHeaders, String cookie, boolean disableScaling,
                                 int videoPipeLanes, VideoPixelFormat videoPixelFormat,
                                 double audioRange, AudioPlaybackMode audioPlaybackMode,
-                                long durationMs,
+                                long durationMs, boolean live,
                                 long positionMs, boolean playing,
                                 boolean waitingForClients, long revision,
                                 long sentAtNanos, long receivedAtNanos) {
@@ -18,11 +18,11 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
                              String requestHeaders, String cookie, boolean disableScaling,
                              int videoPipeLanes, VideoPixelFormat videoPixelFormat,
                              double audioRange, AudioPlaybackMode audioPlaybackMode,
-                             long durationMs, long positionMs, boolean playing,
+                             long durationMs, boolean live, long positionMs, boolean playing,
                              boolean waitingForClients, long revision, long sentAtNanos) {
         this(sessionId, videoId, videoUrl, audioUrl, requestHeaders, cookie, disableScaling,
                 videoPipeLanes, videoPixelFormat, audioRange, audioPlaybackMode,
-                durationMs, positionMs, playing,
+                durationMs, live, positionMs, playing,
                 waitingForClients, revision, sentAtNanos, 0L);
     }
 
@@ -39,6 +39,7 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
         buf.writeDouble(audioRange);
         buf.writeEnum(audioPlaybackMode);
         buf.writeLong(durationMs);
+        buf.writeBoolean(live);
         buf.writeLong(positionMs);
         buf.writeBoolean(playing);
         buf.writeBoolean(waitingForClients);
@@ -55,6 +56,7 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
                 buf.readDouble(),
                 buf.readEnum(AudioPlaybackMode.class),
                 buf.readLong(),
+                buf.readBoolean(),
                 buf.readLong(), buf.readBoolean(), buf.readBoolean(), buf.readLong(),
                 buf.readLong(), System.nanoTime());
     }

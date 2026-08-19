@@ -98,7 +98,10 @@ public final class ClientVideoState {
         session.audioRange = message.audioRange();
         session.audioPlaybackMode = message.audioPlaybackMode();
         session.durationMs = message.durationMs();
-        session.positionMs = clampToDuration(session, compensatedServerPosition(
+        session.live = message.live() || (sameSession && session.live);
+        session.mediaClassificationKnown = message.live()
+                || (sameSession && session.mediaClassificationKnown);
+        session.positionMs = session.live ? 0L : clampToDuration(session, compensatedServerPosition(
                 message.positionMs(), message.playing(), message.waitingForClients(),
                 message.sentAtNanos(), message.receivedAtNanos()));
         session.playing = message.playing();
@@ -122,9 +125,9 @@ public final class ClientVideoState {
                 session.adapter.open(session.videoId, session.videoUrl, session.audioUrl,
                         session.requestHeaders, session.cookie, session.disableScaling,
                         session.videoPipeLanes, session.videoPixelFormat, session.audioRange,
-                        session.audioPlaybackMode,
-                        session.durationMs);
+                        session.audioPlaybackMode, session.durationMs, session.live);
             }
+            session.adapter.setLiveStream(session.live);
             session.adapter.applyServerState(session.positionMs, session.playing,
                     session.waitingForClients, true);
             session.adapter.setClientPaused(clientPaused);
@@ -143,15 +146,20 @@ public final class ClientVideoState {
         if (message.durationMs() > 0L) {
             session.durationMs = message.durationMs();
         }
-        long serverPosition = clampToDuration(session, compensatedServerPosition(
+        if (message.live()) {
+            session.live = true;
+            session.mediaClassificationKnown = true;
+        }
+        long serverPosition = session.live ? 0L : clampToDuration(session, compensatedServerPosition(
                 message.positionMs(), message.playing(), message.waitingForClients(),
                 message.sentAtNanos(), message.receivedAtNanos()));
         long clientPosition = session.adapter == null
                 ? session.positionMs : clampToDuration(session, session.adapter.positionMs());
-        boolean driftRequiresSeek = session.adapter != null && session.adapter.isPlaybackClockStarted()
+        boolean driftRequiresSeek = !session.live && session.adapter != null
+                && session.adapter.isPlaybackClockStarted()
                 && Math.abs(serverPosition - clientPosition) >= HARD_SEEK_THRESHOLD_MS;
-        boolean hardSeek = message.hardSeek() || session.confirmRoutineCorrection(
-                serverPosition, clientPosition, driftRequiresSeek);
+        boolean hardSeek = !session.live && (message.hardSeek() || session.confirmRoutineCorrection(
+                serverPosition, clientPosition, driftRequiresSeek));
         if (message.hardSeek()) {
             session.clearPendingCorrection();
         }
@@ -167,12 +175,13 @@ public final class ClientVideoState {
         }
         session.revision = message.revision();
         if (session.adapter != null) {
+            session.adapter.setLiveStream(session.live);
             session.adapter.applyServerState(session.positionMs, session.playing,
                     session.waitingForClients, hardSeek);
         }
         String screenId = ClientScreenTarget.screenId(session.sessionId);
         VideoManagerScreen.acceptPlaybackState(screenId == null ? session.videoId : screenId,
-                session.positionMs, session.durationMs,
+                session.positionMs, session.durationMs, session.live,
                 session.playing, session.waitingForClients);
     }
 
@@ -215,7 +224,10 @@ public final class ClientVideoState {
             updateProgressOverlay();
             return;
         }
-        maybeRequestTimeSync();
+        if (SESSIONS.values().stream().anyMatch(session ->
+                session.mediaClassificationKnown && !session.live)) {
+            maybeRequestTimeSync();
+        }
         for (SessionState session : SESSIONS.values()) {
             updateSessionLoading(session);
             if (!playbackAvailable || session.adapter == null) {
@@ -225,16 +237,26 @@ public final class ClientVideoState {
             if (clientPaused) {
                 continue;
             }
+            long adapterDuration = session.adapter.durationMs();
+            if (adapterDuration > 0L) {
+                session.durationMs = adapterDuration;
+            }
+            if (!session.readinessReported && session.adapter.isPlaybackReady()) {
+                session.live = session.live || session.adapter.isLiveStream();
+                session.mediaClassificationKnown = true;
+                VideoNetwork.CHANNEL.sendToServer(new VideoReadyMessage(
+                        session.sessionId, session.durationMs, session.live));
+                session.readinessReported = true;
+            }
             if (session.waitingForClients) {
-                long adapterDuration = session.adapter.durationMs();
-                if (adapterDuration > 0L) {
-                    session.durationMs = adapterDuration;
-                }
-                if (!session.readinessReported && session.adapter.isPlaybackReady()) {
-                    VideoNetwork.CHANNEL.sendToServer(new VideoReadyMessage(
-                            session.sessionId, session.durationMs));
-                    session.readinessReported = true;
-                }
+                continue;
+            }
+            if (!session.mediaClassificationKnown) {
+                continue;
+            }
+            if (session.live) {
+                session.positionMs = session.adapter.positionMs();
+                session.playing = session.adapter.isPlaying();
                 continue;
             }
             if (++session.ticksSinceReport < REPORT_INTERVAL_TICKS) {
@@ -247,10 +269,6 @@ public final class ClientVideoState {
             }
             if (session.adapter.isPreparingSeek()) {
                 continue;
-            }
-            long adapterDuration = session.adapter.durationMs();
-            if (adapterDuration > 0L) {
-                session.durationMs = adapterDuration;
             }
             session.positionMs = clampToDuration(session, session.adapter.positionMs());
             session.playing = session.adapter.isPlaying();
@@ -283,7 +301,7 @@ public final class ClientVideoState {
         session.adapter.open(session.videoId, session.videoUrl, session.audioUrl,
                 session.requestHeaders, session.cookie, session.disableScaling,
                 session.videoPipeLanes, session.videoPixelFormat, session.audioRange,
-                session.audioPlaybackMode, session.durationMs);
+                session.audioPlaybackMode, session.durationMs, session.live);
         session.adapter.applyServerState(session.positionMs, session.playing,
                 session.waitingForClients, true);
         session.adapter.setClientPaused(clientPaused);
@@ -327,9 +345,12 @@ public final class ClientVideoState {
         } else if (playbackAvailable && clientPauseStartedNanos != 0L) {
             long pausedDurationMs = TimeUnit.NANOSECONDS.toMillis(
                     Math.max(0L, nowNanos - clientPauseStartedNanos));
-            SESSIONS.keySet().forEach(sessionId ->
-                    VideoNetwork.CHANNEL.sendToServer(new VideoLocalPauseMessage(
-                            sessionId, ++clientPauseSequence, pausedDurationMs)));
+            SESSIONS.values().stream()
+                    .filter(session -> session.mediaClassificationKnown && !session.live)
+                    .map(session -> session.sessionId)
+                    .forEach(sessionId ->
+                            VideoNetwork.CHANNEL.sendToServer(new VideoLocalPauseMessage(
+                                    sessionId, ++clientPauseSequence, pausedDurationMs)));
             clientPauseStartedNanos = 0L;
         }
         clientPaused = paused;
@@ -467,7 +488,9 @@ public final class ClientVideoState {
                     .append(Component.translatable("overlay.video_synchronizer.progress_reconnecting")
                             .withStyle(ChatFormatting.YELLOW, ChatFormatting.BOLD))
                     .append(Component.literal(" -> "))
-                    .append(Component.literal(formatTime(session.adapter.positionMs()))
+                    .append((session.live
+                            ? Component.translatable("overlay.video_synchronizer.progress_live")
+                            : Component.literal(formatTime(session.adapter.positionMs())))
                             .withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD)), false);
             progressOverlayVisible = true;
             return;
@@ -487,10 +510,12 @@ public final class ClientVideoState {
                                 : "overlay.video_synchronizer.progress_paused"))
                         .withStyle(stateColor, ChatFormatting.BOLD))
                 .append(Component.literal("  "))
-                .append(Component.literal(formatTime(currentPosition)))
-                .append(Component.literal(" / "))
-                .append(Component.literal(currentDuration > 0L
-                        ? formatTime(currentDuration) : "--:--:--")), false);
+                .append(session.live
+                        ? Component.translatable("overlay.video_synchronizer.progress_live")
+                        .withStyle(ChatFormatting.AQUA, ChatFormatting.BOLD)
+                        : Component.literal(formatTime(currentPosition) + " / "
+                        + (currentDuration > 0L
+                        ? formatTime(currentDuration) : "--:--:--"))), false);
         progressOverlayVisible = true;
     }
 
@@ -630,6 +655,8 @@ public final class ClientVideoState {
         private double audioRange = 48.0D;
         private AudioPlaybackMode audioPlaybackMode = AudioPlaybackMode.POSITIONAL;
         private long durationMs;
+        private boolean live;
+        private boolean mediaClassificationKnown;
         private long positionMs;
         private boolean playing;
         private boolean waitingForClients;
@@ -682,7 +709,7 @@ public final class ClientVideoState {
         void open(String videoId, String videoUrl, String audioUrl, String requestHeaders,
                   String cookie, boolean disableScaling, int videoPipeLanes,
                   VideoPixelFormat videoPixelFormat, double audioRange,
-                  AudioPlaybackMode audioPlaybackMode, long durationMs);
+                  AudioPlaybackMode audioPlaybackMode, long durationMs, boolean live);
 
         void applyServerState(long positionMs, boolean playing, boolean waitingForClients,
                               boolean hardSeek);
@@ -690,6 +717,13 @@ public final class ClientVideoState {
         long positionMs();
 
         long durationMs();
+
+        default boolean isLiveStream() {
+            return false;
+        }
+
+        default void setLiveStream(boolean live) {
+        }
 
         boolean isPlaying();
 

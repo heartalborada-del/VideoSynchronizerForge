@@ -16,8 +16,8 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
                                       boolean disableScaling, int videoPipeLanes,
                                       VideoPixelFormat videoPixelFormat,
                                       double audioRange, AudioPlaybackMode audioPlaybackMode,
-                                      boolean active, long positionMs, long durationMs, boolean playing,
-                                      boolean waitingForClients) {
+                                      boolean active, long positionMs, long durationMs,
+                                      boolean live, boolean playing, boolean waitingForClients) {
     public void encode(FriendlyByteBuf buf) {
         buf.writeBlockPos(pos);
         buf.writeUtf(screenId, 32);
@@ -33,6 +33,7 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
         buf.writeBoolean(active);
         buf.writeLong(positionMs);
         buf.writeLong(durationMs);
+        buf.writeBoolean(live);
         buf.writeBoolean(playing);
         buf.writeBoolean(waitingForClients);
     }
@@ -47,7 +48,8 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
                 buf.readDouble(),
                 buf.readEnum(AudioPlaybackMode.class),
                 buf.readBoolean(),
-                buf.readLong(), buf.readLong(), buf.readBoolean(), buf.readBoolean());
+                buf.readLong(), buf.readLong(), buf.readBoolean(), buf.readBoolean(),
+                buf.readBoolean());
     }
 
     public static void handle(OpenVideoManagerMessage message,
@@ -77,7 +79,7 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
                 new OpenVideoManagerMessage(pos, manager.getScreenId(), videoUrl, audioUrl,
                         requestHeaders, cookie, disableScaling, videoPipeLanes, videoPixelFormat,
                         audioRange, audioPlaybackMode,
-                        state.active(), state.positionMs(), state.durationMs(), state.playing(),
-                        state.waitingForClients()));
+                        state.active(), state.positionMs(), state.durationMs(), state.live(),
+                        state.playing(), state.waitingForClients()));
     }
 }

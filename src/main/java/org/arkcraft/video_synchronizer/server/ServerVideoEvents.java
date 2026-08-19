@@ -145,9 +145,14 @@ public final class ServerVideoEvents {
                         .requires(source -> source.hasPermission(2))
                         .then(Commands.argument("milliseconds", LongArgumentType.longArg(0L))
                                 .executes(context -> {
-                                    ServerVideoSessionManager.seek(context.getSource().getServer(),
-                                            LongArgumentType.getLong(context, "milliseconds"));
-                                    return 1;
+                                    if (ServerVideoSessionManager.seek(
+                                            context.getSource().getServer(),
+                                            LongArgumentType.getLong(context, "milliseconds"))) {
+                                        return 1;
+                                    }
+                                    context.getSource().sendFailure(Component.translatable(
+                                            "command.video_synchronizer.seek_unavailable"));
+                                    return 0;
                                 })))
                 .then(Commands.literal("weight")
                         .requires(source -> source.hasPermission(2))

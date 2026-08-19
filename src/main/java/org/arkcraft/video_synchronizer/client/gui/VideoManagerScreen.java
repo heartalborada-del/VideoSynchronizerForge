@@ -31,6 +31,7 @@ public final class VideoManagerScreen extends Screen {
     private double audioRange;
     private AudioPlaybackMode audioPlaybackMode;
     private boolean active;
+    private boolean live;
     private boolean playing;
     private boolean waitingForClients;
     private long positionMs;
@@ -72,11 +73,13 @@ public final class VideoManagerScreen extends Screen {
     }
 
     public static void acceptPlaybackState(String screenId, long positionMs, long durationMs,
-                                           boolean playing, boolean waitingForClients) {
+                                           boolean live, boolean playing,
+                                           boolean waitingForClients) {
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.screen instanceof VideoManagerScreen screen && screen.active
                 && screen.screenId.equals(screenId)) {
             screen.positionMs = positionMs;
+            screen.live = live;
             if (durationMs > 0L) {
                 screen.durationMs = durationMs;
             }
@@ -99,6 +102,7 @@ public final class VideoManagerScreen extends Screen {
             screen.waitingForClients = false;
             screen.positionMs = 0L;
             screen.durationMs = 0L;
+            screen.live = false;
             screen.updateButtonState();
         }
     }
@@ -262,8 +266,12 @@ public final class VideoManagerScreen extends Screen {
                 ? "gui.video_synchronizer.manager.status_playing"
                 : "gui.video_synchronizer.manager.status_paused");
         Component status = active
-                ? Component.translatable(statusKey,
-                        formatTime(currentPositionMs()), formatTime(durationMs))
+                ? (live ? Component.translatable(
+                        "gui.video_synchronizer.manager.status_live_"
+                                + (waitingForClients ? "buffering" : (playing
+                                ? "playing" : "paused")))
+                        : Component.translatable(statusKey,
+                        formatTime(currentPositionMs()), formatTime(durationMs)))
                 : Component.translatable("gui.video_synchronizer.manager.status_idle");
         int statusColor = waitingForClients ? 0xD080FF : (active ? 0x80FF80 : 0xA0A0A0);
         graphics.drawString(font, status, formLeft, formTop + 142, statusColor);
@@ -292,6 +300,7 @@ public final class VideoManagerScreen extends Screen {
         audioPlaybackMode = message.audioPlaybackMode();
         splitStreams = !audioUrl.isBlank();
         active = message.active();
+        live = message.live();
         playing = message.playing();
         waitingForClients = message.waitingForClients();
         positionMs = message.positionMs();
@@ -461,11 +470,15 @@ public final class VideoManagerScreen extends Screen {
         }
         pauseButton.active = active && playing && !waitingForClients;
         resumeButton.active = active && !playing && !waitingForClients;
-        seekButton.active = active;
+        seekButton.active = active && !live;
+        positionInput.active = !live;
         stopButton.active = active;
     }
 
     private long currentPositionMs() {
+        if (live) {
+            return 0L;
+        }
         long current = positionMs;
         if (active && playing) {
             current += (System.nanoTime() - stateReceivedNanos) / 1_000_000L;

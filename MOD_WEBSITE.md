@@ -9,11 +9,13 @@
 
 Video Synchronizer lets each screen run an independent server-controlled playback session
 while every player decodes the media locally with FFmpeg. This keeps video traffic and
-decoding work away from the server while preserving synchronized playback across clients.
+decoding work away from the server while preserving synchronized on-demand playback.
+On-demand media shares the server clock; live streams play at each client's current live edge.
 
 ## Highlights
 
-- Server-authoritative play, pause, seek, stop, reconnect, and late-join synchronization
+- Server-authoritative controls and synchronization for on-demand media
+- Independent client live-edge playback without drift seeking for live streams
 - Continuous video walls, floors, and ceilings up to 1024 x 1024 blocks
 - Simultaneous independent playback on multiple screens
 - Per-manager positional, fixed-range, or full-volume server-wide audio
@@ -25,7 +27,7 @@ decoding work away from the server while preserving synchronized playback across
 - Automatic resolution and frame-rate limiting for high-resolution sources
 - Hardware decoding with automatic software fallback
 - Bounded frame buffering with RGB24/RGBA and multi-lane frame transfer
-- Coordinated audio/video recovery if either stream stalls
+- Coordinated audio/video recovery from the synchronized position or current live edge
 - Automatic session cleanup when playback reaches the end
 - English and Simplified Chinese interface
 
@@ -62,7 +64,7 @@ a screen to bind its ID to a Video Manager. Playback controls require permission
 - All players must install the mod and use the same mod version.
 - Media URLs and authentication options are sent to connected clients because decoding
   happens locally. Do not use credentials that players must not receive.
-- Live streams without a known duration cannot use automatic end-of-playback stopping.
+- Live streams disable seeking and playback-time consensus and require manual stopping.
 - `/video stop` stops every active session; a Video Manager stops only its own screen.
 - The embedded FFmpeg packages use LGPL shared builds and include the corresponding
   license and source notices.
@@ -82,11 +84,13 @@ Video Synchronizer is MIT licensed. Bundled FFmpeg distributions remain under LG
 > 为 Minecraft Forge 1.20.1 提供多方块连续屏幕与在线音视频同步播放。
 
 Video Synchronizer 由服务端为每块屏幕维护独立播放会话和权威时钟，各客户端使用 FFmpeg
-在本地完成媒体解码。视频流量和解码开销不会集中在服务端，同时所有玩家仍能看到同步内容。
+在本地完成媒体解码。视频流量和解码开销不会集中在服务端；点播媒体共享服务端时钟，
+直播流则由各客户端播放当前直播边缘。
 
 ## 主要功能
 
-- 服务端统一控制播放、暂停、跳转、停止、重连和中途加入同步
+- 服务端统一控制点播媒体并处理播放时间同步
+- 直播流由各客户端独立播放当前直播边缘，不进行漂移跳转
 - 支持墙面、地面和天花板连续屏幕，最大 1024 x 1024 方块
 - 多块屏幕可同时运行相互独立的播放会话
 - 每个管理器可选择位置衰减、范围内恒定音量或全服满音量广播
@@ -98,7 +102,7 @@ Video Synchronizer 由服务端为每块屏幕维护独立播放会话和权威�
 - 自动限制高分辨率视频的输出尺寸和帧率
 - 支持硬件解码，并在失败时自动回退到软件解码
 - 有界帧缓冲、RGB24/RGBA 输出与多通道帧传输
-- 音频或视频任一路卡住时，两路会从同一同步位置恢复
+- 音频或视频任一路卡住时，两路会从点播同步位置或当前直播边缘一起恢复
 - 播放到媒体结尾后自动停止并清理客户端进程
 - 提供英文和简体中文界面
 
@@ -135,7 +139,7 @@ Modrinth 会列出五个独立版本，请根据客户端选择对应后缀：
 - 所有玩家都需要安装本模组，并使用相同的模组版本。
 - 媒体由客户端本地解码，因此媒体地址和鉴权选项会发送给在线客户端。请勿填写不应向
   玩家公开的凭据。
-- 没有已知时长的直播流无法在播放结尾自动停止。
+- 直播流会禁用跳转与播放时间共识，并需要手动停止。
 - `/video stop` 会停止全部活动会话；视频管理器只停止它所控制的屏幕。
 - 内嵌 FFmpeg 使用 LGPL shared 构建，并附带相应许可证与源码说明。
 

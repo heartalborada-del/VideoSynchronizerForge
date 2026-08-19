@@ -163,18 +163,19 @@ public final class ServerVideoSessionManager {
         broadcastState(session, false);
     }
 
-    public static void seek(MinecraftServer server, long positionMs) {
+    public static boolean seek(MinecraftServer server, long positionMs) {
         Session session = SESSIONS.get(DEFAULT_SESSION_KEY);
-        if (session != null) {
-            seek(server, session, positionMs);
-        }
+        return session != null && seek(server, session, positionMs);
     }
 
     public static void seekForScreen(MinecraftServer server, String screenId, long positionMs) {
         seek(server, requireSession(screenId), positionMs);
     }
 
-    private static void seek(MinecraftServer server, Session session, long positionMs) {
+    private static boolean seek(MinecraftServer server, Session session, long positionMs) {
+        if (session.live) {
+            return false;
+        }
         boolean playWhenReady = session.waitingForClients ? session.playWhenReady : session.playing;
         refreshEligiblePlayers(server, session);
         boolean waiting = !session.eligiblePlayers.isEmpty();
@@ -187,7 +188,9 @@ public final class ServerVideoSessionManager {
         session.reports.clear();
         session.joinConfirmations.clear();
         session.readyDurations.clear();
+        session.readyLiveStreams.clear();
         broadcastState(session, true);
+        return true;
     }
 
     public static void stop() {
@@ -257,14 +260,14 @@ public final class ServerVideoSessionManager {
             return new ControlState(false, "", "", "", "", false, 0,
                     VideoPixelFormat.RGB24, VideoManagerBlockEntity.DEFAULT_AUDIO_RANGE,
                     AudioPlaybackMode.POSITIONAL,
-                    0L, 0L, false, false);
+                    0L, 0L, false, false, false);
         }
         return new ControlState(true, session.videoUrl, session.audioUrl,
                 session.requestOptions.headers(), session.requestOptions.cookie(),
                 session.disableScaling, session.videoPipeLanes, session.videoPixelFormat,
                 session.audioRange, session.audioPlaybackMode,
                 positionAt(session, System.nanoTime()), session.durationMs,
-                session.playing, session.waitingForClients);
+                session.live, session.playing, session.waitingForClients);
     }
 
     public static boolean isPlaybackProtected(ServerLevel level, BlockPos pos) {
@@ -296,7 +299,8 @@ public final class ServerVideoSessionManager {
         if (server != null && !session.eligiblePlayers.contains(player.getUUID())) {
             refreshEligiblePlayers(server, session);
         }
-        if (!session.eligiblePlayers.contains(player.getUUID()) || session.waitingForClients) {
+        if (!session.eligiblePlayers.contains(player.getUUID())
+                || session.waitingForClients || session.live) {
             return;
         }
         long reportedDuration = message.durationMs();
@@ -355,8 +359,7 @@ public final class ServerVideoSessionManager {
         if (!session.eligiblePlayers.contains(player.getUUID())) {
             refreshEligiblePlayers(server, session);
         }
-        if (!session.waitingForClients
-                || !session.eligiblePlayers.contains(player.getUUID())) {
+        if (!session.eligiblePlayers.contains(player.getUUID())) {
             return;
         }
         long duration = message.durationMs();
@@ -365,8 +368,14 @@ public final class ServerVideoSessionManager {
             session.rejectedReports++;
             return;
         }
-        session.readyDurations.put(player.getUUID(), duration);
-        tryBeginPlayback(server, session);
+        if (session.waitingForClients) {
+            session.readyDurations.put(player.getUUID(), duration);
+            session.readyLiveStreams.put(player.getUUID(), message.live());
+            tryBeginPlayback(server, session);
+        } else if (message.live() && !session.live) {
+            promoteToLive(session);
+            broadcastState(session, false);
+        }
     }
 
     public static void acceptClientCapability(MinecraftServer server, ServerPlayer player,
@@ -380,6 +389,7 @@ public final class ServerVideoSessionManager {
         for (Session session : SESSIONS.values()) {
             session.reports.remove(playerId);
             session.readyDurations.remove(playerId);
+            session.readyLiveStreams.remove(playerId);
             session.joinConfirmations.remove(playerId);
             refreshEligiblePlayers(server, session);
             if (session.waitingForClients) {
@@ -400,7 +410,7 @@ public final class ServerVideoSessionManager {
                 || !server.isSingleplayerOwner(player.getGameProfile())
                 || message.sequence() <= session.lastLocalPauseSequence
                 || message.durationMs() < 0L || message.durationMs() > MAX_VIDEO_DURATION_MS
-                || !session.playing || message.durationMs() == 0L) {
+                || !session.playing || session.live || message.durationMs() == 0L) {
             return;
         }
         session.lastLocalPauseSequence = message.sequence();
@@ -461,12 +471,17 @@ public final class ServerVideoSessionManager {
         if (session.waitingForClients) {
             session.readyDurations.keySet().removeIf(
                     id -> !session.eligiblePlayers.contains(id));
+            session.readyLiveStreams.keySet().removeIf(
+                    id -> !session.eligiblePlayers.contains(id));
             if (tryBeginPlayback(server, session)) {
                 return;
             }
             if (periodicBroadcastReady(session)) {
                 broadcastState(session, false);
             }
+            return;
+        }
+        if (session.live) {
             return;
         }
         session.reports.entrySet().removeIf(entry ->
@@ -487,6 +502,7 @@ public final class ServerVideoSessionManager {
         for (Session session : SESSIONS.values()) {
             session.reports.remove(playerId);
             session.readyDurations.remove(playerId);
+            session.readyLiveStreams.remove(playerId);
             session.joinConfirmations.remove(playerId);
             session.eligiblePlayers.remove(playerId);
         }
@@ -506,7 +522,7 @@ public final class ServerVideoSessionManager {
     public static void sendCurrent(ServerPlayer player) {
         for (Session session : SESSIONS.values()) {
             session.reports.remove(player.getUUID());
-            if (session.eligiblePlayers.contains(player.getUUID())) {
+            if (!session.live && session.eligiblePlayers.contains(player.getUUID())) {
                 session.joinConfirmations.put(player.getUUID(), 0);
             } else {
                 session.joinConfirmations.remove(player.getUUID());
@@ -561,14 +577,18 @@ public final class ServerVideoSessionManager {
                     "command.video_synchronizer.status.session", session.videoId,
                     session.sessionId, playbackStateComponent(session.playing,
                             session.waitingForClients)));
-            result = result.copy().append("\n").append(Component.translatable(
-                    "command.video_synchronizer.status.time",
+            result = result.copy().append("\n").append(session.live
+                    ? Component.translatable("command.video_synchronizer.status.live")
+                    : Component.translatable("command.video_synchronizer.status.time",
                     formatTime(serverPosition), formatTime(session.durationMs)));
             result = result.copy().append("\n").append(Component.translatable(
                     "command.video_synchronizer.status.target", targetDescription(session)));
-            result = result.copy().append("\n").append(Component.translatable(
-                    "command.video_synchronizer.status.clients", session.reports.size(),
-                    session.eligiblePlayers.size(), session.rejectedReports));
+            result = result.copy().append("\n").append(session.live
+                    ? Component.translatable("command.video_synchronizer.status.live_clients",
+                    session.eligiblePlayers.size())
+                    : Component.translatable("command.video_synchronizer.status.clients",
+                    session.reports.size(), session.eligiblePlayers.size(),
+                    session.rejectedReports));
 
             if (session.waitingForClients) {
                 int required = requiredReadyCount(session.eligiblePlayers.size());
@@ -606,6 +626,12 @@ public final class ServerVideoSessionManager {
                 result = result.copy().append("\n").append(Component.translatable(
                         "command.video_synchronizer.status.local_unavailable")
                         .withStyle(ChatFormatting.RED));
+                continue;
+            }
+            if (session.live) {
+                result = result.copy().append("\n").append(Component.translatable(
+                        "command.video_synchronizer.status.local_live")
+                        .withStyle(ChatFormatting.GREEN));
                 continue;
             }
             PlayerReport report = session.reports.get(viewer.getUUID());
@@ -648,6 +674,15 @@ public final class ServerVideoSessionManager {
                         "command.video_synchronizer.bossbar.unavailable"));
                 bossBar.setColor(BossEvent.BossBarColor.RED);
                 bossBar.setProgress(0.0F);
+                return;
+            }
+            if (session.live) {
+                bossBar.setName(Component.translatable(
+                        "command.video_synchronizer.bossbar.live", session.videoId,
+                        playbackStateComponent(session.playing, false)));
+                bossBar.setColor(session.playing
+                        ? BossEvent.BossBarColor.GREEN : BossEvent.BossBarColor.YELLOW);
+                bossBar.setProgress(session.playing ? 1.0F : 0.0F);
                 return;
             }
             if (session.waitingForClients) {
@@ -746,6 +781,14 @@ public final class ServerVideoSessionManager {
         if (medianDuration > 0L) {
             session.durationMs = medianDuration;
         }
+        long liveReports = session.readyLiveStreams.values().stream()
+                .filter(Boolean::booleanValue).count();
+        session.live = liveReports > 0L;
+        if (session.live) {
+            session.durationMs = 0L;
+            session.positionMs = 0L;
+            session.reports.clear();
+        }
         long nowNanos = System.nanoTime();
         session.waitingForClients = false;
         session.playing = session.playWhenReady;
@@ -753,9 +796,24 @@ public final class ServerVideoSessionManager {
         session.revision++;
         Set<UUID> readyPlayers = new HashSet<>(session.readyDurations.keySet());
         session.readyDurations.clear();
-        readyPlayers.forEach(playerId -> session.joinConfirmations.put(playerId, 0));
+        session.readyLiveStreams.clear();
+        if (!session.live) {
+            readyPlayers.forEach(playerId -> session.joinConfirmations.put(playerId, 0));
+        }
         broadcastState(session, true);
         return true;
+    }
+
+    private static void promoteToLive(Session session) {
+        session.live = true;
+        session.durationMs = 0L;
+        session.positionMs = 0L;
+        session.positionNanos = System.nanoTime();
+        session.reports.clear();
+        session.joinConfirmations.clear();
+        session.readyDurations.clear();
+        session.readyLiveStreams.clear();
+        session.revision++;
     }
 
     private static void recomputeAuthoritativeState(Session session) {
@@ -808,7 +866,7 @@ public final class ServerVideoSessionManager {
                 session.audioUrl, session.requestOptions.headers(), session.requestOptions.cookie(),
                 session.disableScaling, session.videoPipeLanes, session.videoPixelFormat,
                 session.audioRange, session.audioPlaybackMode,
-                session.durationMs, positionAt(session, nowNanos), session.playing,
+                session.durationMs, session.live, positionAt(session, nowNanos), session.playing,
                 session.waitingForClients, session.revision, nowNanos);
     }
 
@@ -833,7 +891,8 @@ public final class ServerVideoSessionManager {
         long nowNanos = System.nanoTime();
         VideoNetwork.CHANNEL.send(PacketDistributor.ALL.noArg(), new VideoStateMessage(
                 session.sessionId, positionAt(session, nowNanos), session.durationMs,
-                session.playing, session.waitingForClients, hardSeek, session.revision, nowNanos));
+                session.live, session.playing, session.waitingForClients,
+                hardSeek, session.revision, nowNanos));
     }
 
     private static boolean periodicBroadcastReady(Session session) {
@@ -928,10 +987,11 @@ public final class ServerVideoSessionManager {
             if (!eligible.contains(playerId)) {
                 session.reports.remove(playerId);
                 session.readyDurations.remove(playerId);
+                session.readyLiveStreams.remove(playerId);
                 session.joinConfirmations.remove(playerId);
             }
         }
-        if (!session.waitingForClients) {
+        if (!session.waitingForClients && !session.live) {
             for (UUID playerId : eligible) {
                 if (!session.eligiblePlayers.contains(playerId)) {
                     session.joinConfirmations.put(playerId, 0);
@@ -957,6 +1017,9 @@ public final class ServerVideoSessionManager {
     }
 
     private static long positionAt(Session session, long nowNanos) {
+        if (session.live) {
+            return 0L;
+        }
         if (!session.playing || session.waitingForClients) {
             return clampToDuration(session, session.positionMs);
         }
@@ -1097,7 +1160,7 @@ public final class ServerVideoSessionManager {
                                String requestHeaders, String cookie, boolean disableScaling,
                                int videoPipeLanes, VideoPixelFormat videoPixelFormat,
                                double audioRange, AudioPlaybackMode audioPlaybackMode,
-                               long positionMs, long durationMs, boolean playing,
+                               long positionMs, long durationMs, boolean live, boolean playing,
                                boolean waitingForClients) {
     }
 
@@ -1113,6 +1176,7 @@ public final class ServerVideoSessionManager {
         private final double audioRange;
         private final AudioPlaybackMode audioPlaybackMode;
         private long durationMs;
+        private boolean live;
         private long positionMs;
         private boolean playing;
         private boolean waitingForClients;
@@ -1126,6 +1190,7 @@ public final class ServerVideoSessionManager {
         private final Map<UUID, PlayerReport> reports = new HashMap<>();
         private final Map<UUID, Integer> joinConfirmations = new HashMap<>();
         private final Map<UUID, Long> readyDurations = new HashMap<>();
+        private final Map<UUID, Boolean> readyLiveStreams = new HashMap<>();
         private final Set<UUID> eligiblePlayers = new HashSet<>();
 
         private Session(String sessionId, String videoId, String videoUrl, String audioUrl,

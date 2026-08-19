@@ -13,7 +13,8 @@ preserving a smooth and synchronized playback experience for every player.
 
 ## Features
 
-- Server-authoritative pause, resume, seek, reconnect, and late-join synchronization.
+- Server-authoritative pause, resume, seek, reconnect, and late-join synchronization for
+  on-demand media; live streams play independently at each client's current live edge.
 - Continuous screens on walls, floors, and ceilings, up to 1024 x 1024 blocks.
 - Independent screens can run simultaneous playback sessions through their Video Managers.
 - HTTP(S) MP4, HLS, and split DASH video/audio support through FFmpeg.
@@ -72,9 +73,11 @@ Managers keeps those screen sessions independent.
   late-joining players automatically synchronize to the active session.
 - Clients validate both `ffmpeg` and `ffprobe` at startup. Clients that fail validation
   cannot play video and are excluded from preload thresholds and clock consensus.
-- If audio or video stalls, both streams restart from the same synchronized position.
+- If audio or video stalls, both streams recover together. On-demand media restarts from
+  its synchronized position; live media reconnects at the current live edge.
 - `/video sync` is a client-only command that stops local video and audio, requests the
   current server-authoritative positions, and restarts local playback from those positions.
+  For live media, it reconnects at the current live edge instead.
 - Audio is positioned at the center of its screen. Each Video Manager stores its own cutoff
   range, which defaults to 48 blocks, and can instead use fixed-range or global audio.
 - In positional fading mode, clients outside the configured range do not start FFmpeg and
@@ -88,7 +91,8 @@ Managers keeps those screen sessions independent.
 - `/video stop` stops all active sessions; a Video Manager stops only its own screen.
 - `/video pause`, `resume`, and `seek` control the command-started session; use each
   Video Manager to control independent screen sessions.
-- Playback stops automatically at the known media duration. Live streams continue until
+- Playback stops automatically at the known media duration. Live streams do not participate
+  in playback-time consensus or drift seeking, disable seek controls, and continue until
   stopped manually.
 - Media URLs, request headers, and Cookies are sent to clients for local decoding. Do not
   use credentials that connected players must not receive.

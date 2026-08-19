@@ -6,14 +6,14 @@ import org.arkcraft.video_synchronizer.client.ClientVideoState;
 
 import java.util.function.Supplier;
 
-public record VideoStateMessage(String sessionId, long positionMs, long durationMs,
+public record VideoStateMessage(String sessionId, long positionMs, long durationMs, boolean live,
                                 boolean playing, boolean waitingForClients,
                                 boolean hardSeek, long revision, long sentAtNanos,
                                 long receivedAtNanos) {
-    public VideoStateMessage(String sessionId, long positionMs, long durationMs,
+    public VideoStateMessage(String sessionId, long positionMs, long durationMs, boolean live,
                              boolean playing, boolean waitingForClients,
                              boolean hardSeek, long revision, long sentAtNanos) {
-        this(sessionId, positionMs, durationMs, playing, waitingForClients,
+        this(sessionId, positionMs, durationMs, live, playing, waitingForClients,
                 hardSeek, revision, sentAtNanos, 0L);
     }
 
@@ -21,6 +21,7 @@ public record VideoStateMessage(String sessionId, long positionMs, long duration
         buf.writeUtf(sessionId, 64);
         buf.writeLong(positionMs);
         buf.writeLong(durationMs);
+        buf.writeBoolean(live);
         buf.writeBoolean(playing);
         buf.writeBoolean(waitingForClients);
         buf.writeBoolean(hardSeek);
@@ -29,7 +30,7 @@ public record VideoStateMessage(String sessionId, long positionMs, long duration
     }
 
     public static VideoStateMessage decode(FriendlyByteBuf buf) {
-        return new VideoStateMessage(buf.readUtf(64), buf.readLong(), buf.readLong(),
+        return new VideoStateMessage(buf.readUtf(64), buf.readLong(), buf.readLong(), buf.readBoolean(),
                 buf.readBoolean(), buf.readBoolean(), buf.readBoolean(), buf.readLong(),
                 buf.readLong(), System.nanoTime());
     }
