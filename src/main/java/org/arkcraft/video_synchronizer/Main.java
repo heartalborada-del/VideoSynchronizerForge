@@ -14,6 +14,7 @@ import net.minecraft.world.level.material.MapColor;
 import net.minecraft.world.level.block.SoundType;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
+import net.minecraftforge.fml.config.ModConfig;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import net.minecraftforge.registries.DeferredRegister;
 import net.minecraftforge.registries.ForgeRegistries;
@@ -24,6 +25,7 @@ import org.arkcraft.video_synchronizer.block.VideoManagerBlock;
 import org.arkcraft.video_synchronizer.block.VideoManagerBlockEntity;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.item.ScreenSelectionToolItem;
+import org.arkcraft.video_synchronizer.server.VideoServerConfig;
 import org.slf4j.Logger;
 
 @Mod(Main.MODID)
@@ -39,8 +41,7 @@ public final class Main {
 
     public static final RegistryObject<ScreenBlock> SCREEN_BLOCK = BLOCKS.register("screen",
             () -> new ScreenBlock(BlockBehaviour.Properties.of().mapColor(MapColor.COLOR_BLACK)
-                    .strength(-1.0F, 3_600_000.0F).sound(SoundType.METAL)
-                    .noLootTable().noOcclusion()));
+                    .strength(2.0F, 6.0F).sound(SoundType.METAL).noOcclusion()));
     public static final RegistryObject<Item> SCREEN_ITEM = ITEMS.register("screen",
             () -> new BlockItem(SCREEN_BLOCK.get(), new Item.Properties()));
     public static final RegistryObject<BlockEntityType<ScreenBlockEntity>> SCREEN_BLOCK_ENTITY =
@@ -48,8 +49,7 @@ public final class Main {
                     .of(ScreenBlockEntity::new, SCREEN_BLOCK.get()).build(null));
     public static final RegistryObject<VideoManagerBlock> VIDEO_MANAGER_BLOCK = BLOCKS.register("video_manager",
             () -> new VideoManagerBlock(BlockBehaviour.Properties.of().mapColor(MapColor.METAL)
-                    .strength(-1.0F, 3_600_000.0F).sound(SoundType.METAL)
-                    .noLootTable()));
+                    .strength(3.5F, 8.0F).sound(SoundType.METAL)));
     public static final RegistryObject<Item> VIDEO_MANAGER_ITEM = ITEMS.register("video_manager",
             () -> new BlockItem(VIDEO_MANAGER_BLOCK.get(), new Item.Properties()));
     public static final RegistryObject<Item> SCREEN_SELECTION_TOOL = ITEMS.register(
@@ -75,6 +75,7 @@ public final class Main {
         ITEMS.register(modEventBus);
         BLOCK_ENTITIES.register(modEventBus);
         CREATIVE_MODE_TABS.register(modEventBus);
+        context.registerConfig(ModConfig.Type.SERVER, VideoServerConfig.SPEC);
         modEventBus.addListener(this::commonSetup);
     }
 

@@ -13,7 +13,9 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.arkcraft.video_synchronizer.Main;
+import org.arkcraft.video_synchronizer.LocalizedArgumentException;
 import org.arkcraft.video_synchronizer.block.ScreenBlock;
+import org.arkcraft.video_synchronizer.block.ScreenBlockEntity;
 import org.arkcraft.video_synchronizer.block.ScreenLayout;
 import org.arkcraft.video_synchronizer.block.ScreenOrientation;
 
@@ -30,8 +32,9 @@ public final class ScreenCreator {
     public static BlockPos create(ServerPlayer player, int width, int height) {
         if (width < 1 || width > ScreenLayout.MAX_DIMENSION
                 || height < 1 || height > ScreenLayout.MAX_DIMENSION) {
-            throw new IllegalArgumentException("Screen dimensions must be between 1 and "
-                    + ScreenLayout.MAX_DIMENSION);
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.screen_dimensions",
+                    ScreenLayout.MAX_DIMENSION);
         }
 
         ServerLevel level = player.serverLevel();
@@ -40,7 +43,8 @@ public final class ScreenCreator {
         BlockHitResult hit = level.clip(new ClipContext(start, end,
                 ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
         if (hit.getType() != HitResult.Type.BLOCK) {
-            throw new IllegalArgumentException("Look at a solid surface within 32 blocks");
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.look_at_surface", (int) REACH);
         }
 
         Direction facing = hit.getDirection();
@@ -55,11 +59,14 @@ public final class ScreenCreator {
                 BlockPos pos = center.relative(orientation.right(), firstColumn + column)
                         .relative(orientation.up(), firstRow + row);
                 if (!Level.isInSpawnableBounds(pos) || !level.hasChunkAt(pos)) {
-                    throw new IllegalArgumentException("Part of the screen is outside the loaded world");
+                    throw new LocalizedArgumentException(
+                            "message.video_synchronizer.error.screen_outside_world");
                 }
                 BlockState existing = level.getBlockState(pos);
                 if (!existing.canBeReplaced()) {
-                    throw new IllegalArgumentException("The screen area is obstructed at " + pos.toShortString());
+                    throw new LocalizedArgumentException(
+                            "message.video_synchronizer.error.screen_obstructed",
+                            pos.toShortString());
                 }
                 positions.add(pos.immutable());
             }
@@ -81,7 +88,17 @@ public final class ScreenCreator {
         if (!level.dimension().location().toString().equals(dimension)) {
             throw new SelectionException("message.video_synchronizer.selection_tool.dimension");
         }
-        if (facing != secondFacing) {
+        if (!(level.getBlockState(first).getBlock() instanceof ScreenBlock)
+                || !(level.getBlockState(second).getBlock() instanceof ScreenBlock)) {
+            throw new SelectionException("message.video_synchronizer.selection_tool.panels_only");
+        }
+        Direction actualFacing = level.getBlockState(first).getValue(ScreenBlock.FACING);
+        Direction actualScreenUp = level.getBlockState(first).getValue(ScreenBlock.SCREEN_UP);
+        Direction secondActualFacing = level.getBlockState(second).getValue(ScreenBlock.FACING);
+        Direction secondActualScreenUp = level.getBlockState(second).getValue(ScreenBlock.SCREEN_UP);
+        if (facing != secondFacing || facing != actualFacing
+                || actualFacing != secondActualFacing || screenUp != actualScreenUp
+                || actualScreenUp != secondActualScreenUp) {
             throw new SelectionException("message.video_synchronizer.selection_tool.face");
         }
         ScreenOrientation orientation = ScreenOrientation.of(facing, screenUp);
@@ -111,20 +128,19 @@ public final class ScreenCreator {
                     throw new SelectionException(
                             "message.video_synchronizer.selection_tool.unloaded");
                 }
-                if (!level.getBlockState(pos).canBeReplaced()) {
+                BlockState state = level.getBlockState(pos);
+                if (!(state.getBlock() instanceof ScreenBlock)
+                        || state.getValue(ScreenBlock.FACING) != facing
+                        || state.getValue(ScreenBlock.SCREEN_UP) != screenUp) {
                     throw new SelectionException(
-                            "message.video_synchronizer.selection_tool.obstructed",
+                            "message.video_synchronizer.selection_tool.missing_panel",
                             pos.toShortString());
                 }
                 positions.add(pos.immutable());
             }
         }
 
-        BlockState screen = Main.SCREEN_BLOCK.get().defaultBlockState()
-                .setValue(ScreenBlock.FACING, facing)
-                .setValue(ScreenBlock.SCREEN_UP, screenUp);
-        positions.forEach(pos -> level.setBlock(pos, screen, Block.UPDATE_CLIENTS));
-        return second;
+        return origin;
     }
 
     private static int dot(int dx, int dy, int dz, Direction direction) {

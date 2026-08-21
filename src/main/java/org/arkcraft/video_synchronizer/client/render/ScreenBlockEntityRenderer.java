@@ -127,7 +127,8 @@ public final class ScreenBlockEntityRenderer implements BlockEntityRenderer<Scre
         VertexConsumer consumer = buffers.getBuffer(
                 RenderType.entityCutoutNoCullZOffset(BORDER_TEXTURE));
         boolean drawn = false;
-        if (!connects(level, pos, orientation, orientation.right().getOpposite())) {
+        if (!connects(level, pos, orientation, blockEntity.getScreenUuid(),
+                orientation.right().getOpposite())) {
             rectangle(consumer, pose.pose(), pose.normal(), orientation,
                     -BORDER_SIDE_OFFSET, BORDER_WIDTH, 0.0F, 1.0F, BORDER_OFFSET,
                     0.0F, 1.0F, 0.0F, 1.0F, packedLight);
@@ -135,7 +136,8 @@ public final class ScreenBlockEntityRenderer implements BlockEntityRenderer<Scre
                     -BORDER_SIDE_OFFSET, orientation.right().getOpposite(), packedLight);
             drawn = true;
         }
-        if (!connects(level, pos, orientation, orientation.right())) {
+        if (!connects(level, pos, orientation, blockEntity.getScreenUuid(),
+                orientation.right())) {
             rectangle(consumer, pose.pose(), pose.normal(), orientation,
                     1.0F - BORDER_WIDTH, 1.0F + BORDER_SIDE_OFFSET,
                     0.0F, 1.0F, BORDER_OFFSET,
@@ -144,7 +146,8 @@ public final class ScreenBlockEntityRenderer implements BlockEntityRenderer<Scre
                     1.0F + BORDER_SIDE_OFFSET, orientation.right(), packedLight);
             drawn = true;
         }
-        if (!connects(level, pos, orientation, orientation.up().getOpposite())) {
+        if (!connects(level, pos, orientation, blockEntity.getScreenUuid(),
+                orientation.up().getOpposite())) {
             rectangle(consumer, pose.pose(), pose.normal(), orientation,
                     0.0F, 1.0F, -BORDER_SIDE_OFFSET, BORDER_WIDTH, BORDER_OFFSET,
                     0.0F, 1.0F, 0.0F, 1.0F, packedLight);
@@ -152,7 +155,8 @@ public final class ScreenBlockEntityRenderer implements BlockEntityRenderer<Scre
                     -BORDER_SIDE_OFFSET, orientation.up().getOpposite(), packedLight);
             drawn = true;
         }
-        if (!connects(level, pos, orientation, orientation.up())) {
+        if (!connects(level, pos, orientation, blockEntity.getScreenUuid(),
+                orientation.up())) {
             rectangle(consumer, pose.pose(), pose.normal(), orientation,
                     0.0F, 1.0F, 1.0F - BORDER_WIDTH,
                     1.0F + BORDER_SIDE_OFFSET, BORDER_OFFSET,
@@ -173,17 +177,24 @@ public final class ScreenBlockEntityRenderer implements BlockEntityRenderer<Scre
         }
         ScreenOrientation orientation = orientation(blockEntity.getBlockState());
         BlockPos pos = blockEntity.getBlockPos();
-        return !connects(level, pos, orientation, orientation.right().getOpposite())
-                || !connects(level, pos, orientation, orientation.right())
-                || !connects(level, pos, orientation, orientation.up().getOpposite())
-                || !connects(level, pos, orientation, orientation.up());
+        return !connects(level, pos, orientation, blockEntity.getScreenUuid(),
+                orientation.right().getOpposite())
+                || !connects(level, pos, orientation, blockEntity.getScreenUuid(),
+                orientation.right())
+                || !connects(level, pos, orientation, blockEntity.getScreenUuid(),
+                orientation.up().getOpposite())
+                || !connects(level, pos, orientation, blockEntity.getScreenUuid(),
+                orientation.up());
     }
 
     private static boolean connects(Level level, BlockPos pos, ScreenOrientation orientation,
-                                    Direction direction) {
-        BlockState neighbor = level.getBlockState(pos.relative(direction));
+                                    java.util.UUID screenUuid, Direction direction) {
+        BlockPos neighborPos = pos.relative(direction);
+        BlockState neighbor = level.getBlockState(neighborPos);
         return neighbor.getBlock() instanceof ScreenBlock
-                && orientation(neighbor).equals(orientation);
+                && orientation(neighbor).equals(orientation)
+                && level.getBlockEntity(neighborPos) instanceof ScreenBlockEntity screen
+                && java.util.Objects.equals(screenUuid, screen.getScreenUuid());
     }
 
     private static ScreenOrientation orientation(BlockState state) {

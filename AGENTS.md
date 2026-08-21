@@ -72,7 +72,9 @@ synchronization. This guidance applies only after validation has been authorized
   weighted consensus.
 - Natural playback completion must use the normal stop path so every client releases its
   decoder processes and texture resources.
-
+- Dont upgrade the protocol version unless the server and all clients can handle the new packet layout. Never
+  downgrade the protocol version unless the server and all clients can handle the old
+  packet layout.
 ## FFmpeg and concurrency
 
 - Never perform decoding, probing, blocking pipe I/O, or audio-device writes on the render
@@ -127,6 +129,8 @@ When runtime validation is authorized, cover the relevant cases:
    no FFmpeg processes behind.
 6. Wall, floor, and ceiling layouts render one continuous correctly oriented image.
 7. A dedicated server starts without loading client-only classes.
+8. Do not generate any test code without real client-side rendering, FFmpeg, or audio output.
+9. Do not generate modification, diff, validation, or rollback artifacts.
 
 Inspect `run/logs/latest.log` and `run/logs/debug.log` after runtime tests. Never commit
 generated `run/`, `build/`, IDE, cache, or log files.

@@ -12,17 +12,19 @@ import org.arkcraft.video_synchronizer.network.VideoNetwork;
 
 public final class ScreenBindingScreen extends Screen {
     private final BlockPos screenPos;
+    private final BlockPos selectionEnd;
     private final String initialId;
     private EditBox idInput;
 
-    private ScreenBindingScreen(BlockPos screenPos, String initialId) {
+    private ScreenBindingScreen(BlockPos screenPos, BlockPos selectionEnd, String initialId) {
         super(Component.translatable("gui.video_synchronizer.binding.title"));
         this.screenPos = screenPos;
+        this.selectionEnd = selectionEnd;
         this.initialId = initialId;
     }
 
-    public static void open(BlockPos pos, String screenId) {
-        Minecraft.getInstance().setScreen(new ScreenBindingScreen(pos, screenId));
+    public static void open(BlockPos pos, BlockPos selectionEnd, String screenId) {
+        Minecraft.getInstance().setScreen(new ScreenBindingScreen(pos, selectionEnd, screenId));
     }
 
     @Override
@@ -40,15 +42,12 @@ public final class ScreenBindingScreen extends Screen {
         addRenderableWidget(Button.builder(Component.translatable(
                 "gui.video_synchronizer.binding.bind"), button -> {
             VideoNetwork.CHANNEL.sendToServer(new UpdateScreenBindingMessage(
-                    screenPos, idInput.getValue(), true));
+                    screenPos, selectionEnd, idInput.getValue(), true));
             onClose();
         }).bounds(centerX - 100, top + 30, 96, 20).build());
         addRenderableWidget(Button.builder(Component.translatable(
-                "gui.video_synchronizer.binding.unbind"), button -> {
-            VideoNetwork.CHANNEL.sendToServer(new UpdateScreenBindingMessage(
-                    screenPos, idInput.getValue(), false));
-            onClose();
-        }).bounds(centerX + 4, top + 30, 96, 20).build());
+                "gui.cancel"), button -> onClose())
+                .bounds(centerX + 4, top + 30, 96, 20).build());
     }
 
     @Override

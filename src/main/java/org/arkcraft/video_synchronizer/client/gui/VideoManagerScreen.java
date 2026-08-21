@@ -14,12 +14,18 @@ import org.arkcraft.video_synchronizer.network.MediaRequestOptions;
 import org.arkcraft.video_synchronizer.network.VideoManagerActionMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.server.ScreenAccessMode;
+import org.arkcraft.video_synchronizer.network.ScreenAccessRole;
+import org.arkcraft.video_synchronizer.network.ScreenPermissionActionMessage;
 
+import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 
 public final class VideoManagerScreen extends Screen {
     private final BlockPos managerPos;
     private String screenId;
+    private String boundScreenId;
     private String videoUrl;
     private String audioUrl;
     private String requestHeaders;
@@ -37,6 +43,12 @@ public final class VideoManagerScreen extends Screen {
     private long positionMs;
     private long durationMs;
     private long stateReceivedNanos;
+    private boolean canControl;
+    private boolean canEdit;
+    private boolean canManage;
+    private boolean requestMetadataAllowed;
+    private boolean globalAudioAllowed;
+    private List<OpenVideoManagerMessage.ScreenOption> availableScreens = List.of();
 
     private EditBox screenIdInput;
     private EditBox videoUrlInput;
@@ -52,6 +64,12 @@ public final class VideoManagerScreen extends Screen {
     private Button resumeButton;
     private Button seekButton;
     private Button stopButton;
+    private Button saveButton;
+    private Button startButton;
+    private Button headersButton;
+    private Button cookieButton;
+    private Button screenSelectButton;
+    private Button permissionsButton;
     private int formLeft;
     private int formTop;
     private int formWidth;
@@ -77,7 +95,7 @@ public final class VideoManagerScreen extends Screen {
                                            boolean waitingForClients) {
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.screen instanceof VideoManagerScreen screen && screen.active
-                && screen.screenId.equals(screenId)) {
+                && screen.boundScreenId.equals(screenId)) {
             screen.positionMs = positionMs;
             screen.live = live;
             if (durationMs > 0L) {
@@ -96,7 +114,7 @@ public final class VideoManagerScreen extends Screen {
     public static void acceptStop(String screenId) {
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.screen instanceof VideoManagerScreen screen && screen.active
-                && screen.screenId.equals(screenId)) {
+                && screen.boundScreenId.equals(screenId)) {
             screen.active = false;
             screen.playing = false;
             screen.waitingForClients = false;
@@ -113,12 +131,23 @@ public final class VideoManagerScreen extends Screen {
         formLeft = (width - formWidth) / 2;
         formTop = Math.max(3, (height - 236) / 2);
 
-        screenIdInput = new EditBox(font, formLeft, formTop + 24, formWidth, 20,
+        int screenSelectWidth = 68;
+        int permissionsWidth = 54;
+        int screenInputWidth = formWidth - screenSelectWidth - permissionsWidth - 8;
+        screenIdInput = new EditBox(font, formLeft, formTop + 24, screenInputWidth, 20,
                 Component.translatable("gui.video_synchronizer.manager.screen_id"));
         screenIdInput.setMaxLength(32);
         screenIdInput.setFilter(value -> value.matches("[a-zA-Z0-9_-]*"));
         screenIdInput.setValue(screenId);
         addRenderableWidget(screenIdInput);
+        screenSelectButton = addRenderableWidget(Button.builder(Component.translatable(
+                        "gui.video_synchronizer.manager.select_screen"), button -> openScreenSelector())
+                .bounds(formLeft + screenInputWidth + 4, formTop + 24,
+                        screenSelectWidth, 20).build());
+        permissionsButton = addRenderableWidget(Button.builder(Component.translatable(
+                        "gui.video_synchronizer.manager.permissions"), button -> openPermissions())
+                .bounds(formLeft + screenInputWidth + screenSelectWidth + 8, formTop + 24,
+                        permissionsWidth, 20).build());
 
         int modeButtonSize = 20;
         int modeButtonGap = 4;
@@ -142,11 +171,11 @@ public final class VideoManagerScreen extends Screen {
         addRenderableWidget(audioUrlInput);
 
         int optionButtonWidth = (formWidth - 16) / 5;
-        addRenderableWidget(Button.builder(
+        headersButton = addRenderableWidget(Button.builder(
                 Component.translatable("gui.video_synchronizer.manager.request_headers"),
                 button -> openHeadersEditor())
                 .bounds(formLeft, formTop + 116, optionButtonWidth, 20).build());
-        addRenderableWidget(Button.builder(
+        cookieButton = addRenderableWidget(Button.builder(
                 Component.translatable("gui.video_synchronizer.manager.cookie"),
                 button -> openCookieEditor())
                 .bounds(formLeft + optionButtonWidth + 4, formTop + 116,
@@ -199,17 +228,17 @@ public final class VideoManagerScreen extends Screen {
         addRenderableWidget(audioRangeInput);
 
         audioModeButton = addRenderableWidget(Button.builder(Component.empty(), button -> {
-                    audioPlaybackMode = audioPlaybackMode.next();
+                    audioPlaybackMode = nextAudioPlaybackMode();
                     updateAudioModeButton();
                 }).bounds(audioRangeInput.getX() + audioRangeWidth + rowGap,
                         formTop + 165, audioModeWidth, 20).build());
 
         int halfWidth = (formWidth - 4) / 2;
-        addRenderableWidget(Button.builder(
+        saveButton = addRenderableWidget(Button.builder(
                 Component.translatable("gui.video_synchronizer.manager.save"),
                 button -> send(VideoManagerActionMessage.Action.SAVE))
                 .bounds(formLeft, formTop + 190, halfWidth, 20).build());
-        addRenderableWidget(Button.builder(
+        startButton = addRenderableWidget(Button.builder(
                 Component.translatable("gui.video_synchronizer.manager.start"),
                 button -> send(VideoManagerActionMessage.Action.START))
                 .bounds(formLeft + halfWidth + 4, formTop + 190, halfWidth, 20).build());
@@ -289,6 +318,7 @@ public final class VideoManagerScreen extends Screen {
 
     private void applyState(OpenVideoManagerMessage message) {
         screenId = message.screenId();
+        boundScreenId = message.screenId();
         videoUrl = message.videoUrl();
         audioUrl = message.audioUrl();
         requestHeaders = message.requestHeaders();
@@ -303,6 +333,12 @@ public final class VideoManagerScreen extends Screen {
         live = message.live();
         playing = message.playing();
         waitingForClients = message.waitingForClients();
+        canControl = message.canControl();
+        canEdit = message.canEdit();
+        canManage = message.canManage();
+        requestMetadataAllowed = message.requestMetadataAllowed();
+        globalAudioAllowed = message.globalAudioAllowed();
+        availableScreens = List.copyOf(message.screens());
         positionMs = message.positionMs();
         durationMs = message.durationMs();
         stateReceivedNanos = System.nanoTime();
@@ -371,6 +407,28 @@ public final class VideoManagerScreen extends Screen {
                 value -> cookie = value));
     }
 
+    private void openScreenSelector() {
+        captureConfigurationInputs();
+        minecraft.setScreen(new AuthorizedScreenSelectionScreen(this, availableScreens));
+    }
+
+    private void openPermissions() {
+        VideoNetwork.CHANNEL.sendToServer(new ScreenPermissionActionMessage(
+                managerPos, ScreenPermissionActionMessage.Action.OPEN, "",
+                new UUID(0L, 0L), ScreenAccessRole.CONTROL, ScreenAccessMode.PRIVATE));
+    }
+
+    void selectScreen(OpenVideoManagerMessage.ScreenOption selected) {
+        screenId = selected.screenId();
+        canControl = true;
+        canEdit = true;
+        canManage = selected.manageable();
+        if (screenIdInput != null) {
+            screenIdInput.setValue(selected.screenId());
+            updateButtonState();
+        }
+    }
+
     private void captureConfigurationInputs() {
         screenId = screenIdInput.getValue();
         videoUrl = videoUrlInput.getValue();
@@ -394,7 +452,7 @@ public final class VideoManagerScreen extends Screen {
                 : "gui.video_synchronizer.manager.mode_combined_short"));
         streamModeButton.setTooltip(Tooltip.create(Component.translatable(modeKey)));
         audioUrlInput.visible = splitStreams;
-        audioUrlInput.active = splitStreams;
+        audioUrlInput.active = canEdit && splitStreams;
     }
 
     private void updateScalingButton() {
@@ -443,7 +501,15 @@ public final class VideoManagerScreen extends Screen {
                 "gui.video_synchronizer.manager.audio_mode_" + suffix + "_short"));
         audioModeButton.setTooltip(Tooltip.create(Component.translatable(
                 "gui.video_synchronizer.manager.audio_mode_" + suffix)));
-        audioRangeInput.active = audioPlaybackMode != AudioPlaybackMode.GLOBAL;
+        audioRangeInput.active = canEdit && audioPlaybackMode != AudioPlaybackMode.GLOBAL;
+    }
+
+    private AudioPlaybackMode nextAudioPlaybackMode() {
+        if (globalAudioAllowed) {
+            return audioPlaybackMode.next();
+        }
+        return audioPlaybackMode == AudioPlaybackMode.POSITIONAL
+                ? AudioPlaybackMode.FIXED_RANGE : AudioPlaybackMode.POSITIONAL;
     }
 
     private static int nextVideoPipeLanes(int lanes) {
@@ -468,11 +534,29 @@ public final class VideoManagerScreen extends Screen {
         if (pauseButton == null) {
             return;
         }
-        pauseButton.active = active && playing && !waitingForClients;
-        resumeButton.active = active && !playing && !waitingForClients;
-        seekButton.active = active && !live;
-        positionInput.active = !live;
-        stopButton.active = active;
+        screenIdInput.active = canEdit;
+        videoUrlInput.active = canEdit;
+        streamModeButton.active = canEdit;
+        headersButton.active = canEdit && requestMetadataAllowed;
+        cookieButton.active = canEdit && requestMetadataAllowed;
+        scalingButton.active = canEdit;
+        pipeLanesButton.active = canEdit;
+        pixelFormatButton.active = canEdit;
+        audioModeButton.active = canEdit;
+        screenSelectButton.active = !availableScreens.isEmpty();
+        permissionsButton.active = canManage && !boundScreenId.isBlank();
+        saveButton.active = canEdit;
+        boolean globalActionAllowed = globalAudioAllowed
+                || audioPlaybackMode != AudioPlaybackMode.GLOBAL;
+        startButton.active = canControl && globalActionAllowed;
+        pauseButton.active = canControl && active && playing && !waitingForClients;
+        resumeButton.active = canControl && globalActionAllowed
+                && active && !playing && !waitingForClients;
+        seekButton.active = canControl && globalActionAllowed && active && !live;
+        positionInput.active = canControl && globalActionAllowed && !live;
+        stopButton.active = canControl && active;
+        updateStreamModeControls();
+        updateAudioModeButton();
     }
 
     private long currentPositionMs() {

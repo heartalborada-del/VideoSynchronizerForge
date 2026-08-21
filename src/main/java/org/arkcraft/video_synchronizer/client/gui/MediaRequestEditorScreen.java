@@ -11,6 +11,7 @@ import net.minecraft.client.gui.components.events.GuiEventListener;
 import net.minecraft.client.gui.narration.NarratableEntry;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
+import org.arkcraft.video_synchronizer.LocalizedArgumentException;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -32,7 +33,7 @@ final class MediaRequestEditorScreen extends Screen {
     private KeyValueList entries;
     private MultiLineEditBox importInput;
     private Button doneButton;
-    private String validationError;
+    private Component validationError;
     private int editorWidth;
     private boolean importMode;
 
@@ -227,20 +228,20 @@ final class MediaRequestEditorScreen extends Screen {
             String value = importInput.getValue();
             if (value.isBlank()) {
                 validationError = Component.translatable(
-                        "gui.video_synchronizer.editor.import_empty").getString();
+                        "gui.video_synchronizer.editor.import_empty");
                 return;
             }
             String importValue = cookieEditor ? normalizeCookieImport(value) : value;
             List<KeyValuePair> importedPairs = parseValue(importValue);
             if (importedPairs.isEmpty()) {
                 validationError = Component.translatable(
-                        "gui.video_synchronizer.editor.import_empty").getString();
+                        "gui.video_synchronizer.editor.import_empty");
                 return;
             }
             entries.addImportedRows(importedPairs);
             closeImportMode();
         } catch (IllegalArgumentException exception) {
-            validationError = exception.getMessage();
+            validationError = LocalizedArgumentException.component(exception);
         }
     }
 
@@ -265,7 +266,7 @@ final class MediaRequestEditorScreen extends Screen {
             serializeEntries();
             validationError = null;
         } catch (IllegalArgumentException exception) {
-            validationError = exception.getMessage();
+            validationError = LocalizedArgumentException.component(exception);
         }
         if (doneButton != null) {
             doneButton.active = validationError == null;
@@ -281,7 +282,8 @@ final class MediaRequestEditorScreen extends Screen {
                 continue;
             }
             if (key.isEmpty()) {
-                throw new IllegalArgumentException("Key cannot be empty");
+                throw new LocalizedArgumentException(
+                        "gui.video_synchronizer.editor.key_empty");
             }
             if (!serialized.isEmpty()) {
                 serialized.append(cookieEditor ? "; " : "\n");
@@ -301,7 +303,7 @@ final class MediaRequestEditorScreen extends Screen {
             save.accept(serializeEntries());
             minecraft.setScreen(parent);
         } catch (IllegalArgumentException exception) {
-            validationError = exception.getMessage();
+            validationError = LocalizedArgumentException.component(exception);
             doneButton.active = false;
         }
     }

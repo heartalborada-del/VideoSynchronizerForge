@@ -11,7 +11,10 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.level.Level;
 import net.minecraftforge.network.PacketDistributor;
 import org.arkcraft.video_synchronizer.network.OpenScreenBindingMessage;
+import org.arkcraft.video_synchronizer.network.OpenPlaybackConsentMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
+import org.arkcraft.video_synchronizer.server.ServerScreenRegistry;
+import org.arkcraft.video_synchronizer.server.VideoPermissionService;
 import net.minecraft.world.level.block.BaseEntityBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -74,13 +77,26 @@ public final class ScreenBlock extends BaseEntityBlock {
     @Override
     public InteractionResult use(BlockState state, Level level, BlockPos pos, Player player,
                                  InteractionHand hand, BlockHitResult hit) {
-        if (player.isSecondaryUseActive() || !player.hasPermissions(2)) {
-            return InteractionResult.PASS;
-        }
         if (!level.isClientSide && player instanceof ServerPlayer serverPlayer
                 && level.getBlockEntity(pos) instanceof ScreenBlockEntity screen) {
+            String screenId = ServerScreenRegistry.screenId(serverPlayer.serverLevel(), screen);
+            if (!screenId.isBlank()
+                    && (player.isSecondaryUseActive()
+                    || !ServerScreenRegistry.hasPlaybackConsent(
+                    serverPlayer, screenId))) {
+                OpenPlaybackConsentMessage.send(serverPlayer, pos, screenId);
+                return InteractionResult.CONSUME;
+            }
+            boolean canBind = screenId.isBlank()
+                    ? VideoPermissionService.canCreate(serverPlayer)
+                    : ServerScreenRegistry.find(serverPlayer.getServer(), screenId)
+                    .map(record -> VideoPermissionService.canBind(serverPlayer, record))
+                    .orElse(false);
+            if (!canBind) {
+                return InteractionResult.CONSUME;
+            }
             VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> serverPlayer),
-                    new OpenScreenBindingMessage(pos, screen.getScreenId()));
+                    new OpenScreenBindingMessage(pos, pos, screenId));
         }
         return InteractionResult.sidedSuccess(level.isClientSide);
     }

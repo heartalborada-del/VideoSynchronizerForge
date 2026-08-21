@@ -77,6 +77,26 @@ public final class VideoNetwork {
         CHANNEL.messageBuilder(VideoManagerActionMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
                 .encoder(VideoManagerActionMessage::encode).decoder(VideoManagerActionMessage::decode)
                 .consumerMainThread(VideoManagerActionMessage::handle).add();
+        CHANNEL.messageBuilder(ScreenPermissionActionMessage.class, nextId++,
+                        NetworkDirection.PLAY_TO_SERVER)
+                .encoder(ScreenPermissionActionMessage::encode)
+                .decoder(ScreenPermissionActionMessage::decode)
+                .consumerMainThread(ScreenPermissionActionMessage::handle).add();
+        CHANNEL.messageBuilder(OpenScreenPermissionsMessage.class, nextId++,
+                        NetworkDirection.PLAY_TO_CLIENT)
+                .encoder(OpenScreenPermissionsMessage::encode)
+                .decoder(OpenScreenPermissionsMessage::decode)
+                .consumerMainThread(OpenScreenPermissionsMessage::handle).add();
+        CHANNEL.messageBuilder(OpenPlaybackConsentMessage.class, nextId++,
+                        NetworkDirection.PLAY_TO_CLIENT)
+                .encoder(OpenPlaybackConsentMessage::encode)
+                .decoder(OpenPlaybackConsentMessage::decode)
+                .consumerMainThread(OpenPlaybackConsentMessage::handle).add();
+        CHANNEL.messageBuilder(UpdatePlaybackConsentMessage.class, nextId++,
+                        NetworkDirection.PLAY_TO_SERVER)
+                .encoder(UpdatePlaybackConsentMessage::encode)
+                .decoder(UpdatePlaybackConsentMessage::decode)
+                .consumerMainThread(UpdatePlaybackConsentMessage::handle).add();
         CHANNEL.messageBuilder(VideoTimeSyncRequestMessage.class, nextId++, NetworkDirection.PLAY_TO_SERVER)
                 .encoder(VideoTimeSyncRequestMessage::encode).decoder(VideoTimeSyncRequestMessage::decode)
                 .consumerMainThread(VideoTimeSyncRequestMessage::handle).add();

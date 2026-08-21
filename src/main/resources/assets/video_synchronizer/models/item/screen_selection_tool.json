@@ -1,6 +1,6 @@
 {
   "parent": "minecraft:item/handheld",
   "textures": {
-    "layer0": "minecraft:item/golden_axe"
+    "layer0": "video_synchronizer:item/screen_selection_tool"
   }
 }

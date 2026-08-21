@@ -8,6 +8,8 @@ import org.arkcraft.video_synchronizer.Main;
 import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
 import org.arkcraft.video_synchronizer.network.AudioPlaybackMode;
 
+import java.util.UUID;
+
 public final class VideoManagerBlockEntity extends BlockEntity {
     public static final double DEFAULT_AUDIO_RANGE = 48.0D;
 
@@ -21,6 +23,7 @@ public final class VideoManagerBlockEntity extends BlockEntity {
     private VideoPixelFormat videoPixelFormat = VideoPixelFormat.RGB24;
     private double audioRange = DEFAULT_AUDIO_RANGE;
     private AudioPlaybackMode audioPlaybackMode = AudioPlaybackMode.POSITIONAL;
+    private UUID ownerId;
 
     public VideoManagerBlockEntity(BlockPos pos, BlockState state) {
         super(Main.VIDEO_MANAGER_BLOCK_ENTITY.get(), pos, state);
@@ -66,6 +69,21 @@ public final class VideoManagerBlockEntity extends BlockEntity {
         return audioPlaybackMode;
     }
 
+    public UUID getOwnerId() {
+        return ownerId;
+    }
+
+    public void setOwnerIfAbsent(UUID ownerId) {
+        if (this.ownerId == null && ownerId != null) {
+            this.ownerId = ownerId;
+            setChanged();
+        }
+    }
+
+    public boolean isOwner(UUID playerId) {
+        return ownerId != null && ownerId.equals(playerId);
+    }
+
     public void setConfiguration(String screenId, String videoUrl, String audioUrl,
                                  String requestHeaders, String cookie,
                                  boolean disableScaling, int videoPipeLanes,
@@ -99,6 +117,9 @@ public final class VideoManagerBlockEntity extends BlockEntity {
         tag.putString("VideoPixelFormat", videoPixelFormat.name());
         tag.putDouble("AudioRange", audioRange);
         tag.putString("AudioPlaybackMode", audioPlaybackMode.name());
+        if (ownerId != null) {
+            tag.putUUID("Owner", ownerId);
+        }
     }
 
     @Override
@@ -116,6 +137,7 @@ public final class VideoManagerBlockEntity extends BlockEntity {
         audioRange = normalizeAudioRange(tag.contains("AudioRange")
                 ? tag.getDouble("AudioRange") : DEFAULT_AUDIO_RANGE);
         audioPlaybackMode = AudioPlaybackMode.fromName(tag.getString("AudioPlaybackMode"));
+        ownerId = tag.hasUUID("Owner") ? tag.getUUID("Owner") : null;
     }
 
     private static int normalizeVideoPipeLanes(int lanes) {

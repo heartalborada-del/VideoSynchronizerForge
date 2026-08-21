@@ -6,6 +6,8 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.BaseEntityBlock;
@@ -20,6 +22,8 @@ import net.minecraft.world.level.block.state.StateDefinition;
 import net.minecraft.world.level.block.state.properties.DirectionProperty;
 import net.minecraft.world.phys.BlockHitResult;
 import org.arkcraft.video_synchronizer.network.OpenVideoManagerMessage;
+import org.arkcraft.video_synchronizer.network.OpenPlaybackConsentMessage;
+import org.arkcraft.video_synchronizer.server.ServerScreenRegistry;
 import org.jetbrains.annotations.Nullable;
 
 public final class VideoManagerBlock extends BaseEntityBlock {
@@ -60,14 +64,31 @@ public final class VideoManagerBlock extends BaseEntityBlock {
     @Override
     public InteractionResult use(BlockState state, Level level, BlockPos pos, Player player,
                                  InteractionHand hand, BlockHitResult hit) {
-        if (player.isSecondaryUseActive() || !player.hasPermissions(2)) {
-            return InteractionResult.PASS;
-        }
         if (!level.isClientSide && player instanceof ServerPlayer serverPlayer
                 && level.getBlockEntity(pos) instanceof VideoManagerBlockEntity manager) {
+            manager.setOwnerIfAbsent(player.getUUID());
+            boolean screenExists = ServerScreenRegistry.find(
+                    serverPlayer.getServer(), manager.getScreenId()).isPresent();
+            if (screenExists
+                    && (player.isSecondaryUseActive()
+                    || !ServerScreenRegistry.hasPlaybackConsent(
+                    serverPlayer, manager.getScreenId()))) {
+                OpenPlaybackConsentMessage.send(serverPlayer, pos, manager.getScreenId());
+                return InteractionResult.CONSUME;
+            }
             OpenVideoManagerMessage.send(serverPlayer, pos, manager);
         }
         return InteractionResult.sidedSuccess(level.isClientSide);
+    }
+
+    @Override
+    public void setPlacedBy(Level level, BlockPos pos, BlockState state,
+                            @Nullable LivingEntity placer, ItemStack stack) {
+        super.setPlacedBy(level, pos, state, placer, stack);
+        if (!level.isClientSide && placer instanceof Player player
+                && level.getBlockEntity(pos) instanceof VideoManagerBlockEntity manager) {
+            manager.setOwnerIfAbsent(player.getUUID());
+        }
     }
 
     @Nullable

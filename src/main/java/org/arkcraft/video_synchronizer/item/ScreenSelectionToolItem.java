@@ -14,9 +14,14 @@ import net.minecraft.world.item.TooltipFlag;
 import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.world.level.Level;
 import net.minecraftforge.network.PacketDistributor;
+import org.arkcraft.video_synchronizer.LocalizedArgumentException;
 import org.arkcraft.video_synchronizer.network.OpenScreenBindingMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.server.ScreenCreator;
+import org.arkcraft.video_synchronizer.server.ServerScreenRegistry;
+import org.arkcraft.video_synchronizer.server.VideoPermissionService;
+import org.arkcraft.video_synchronizer.server.VideoUsagePolicy;
+import org.arkcraft.video_synchronizer.block.ScreenBlock;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.List;
@@ -40,7 +45,8 @@ public final class ScreenSelectionToolItem extends Item {
         if (!(context.getPlayer() instanceof ServerPlayer player)) {
             return InteractionResult.PASS;
         }
-        if (!player.hasPermissions(2)) {
+        if (!VideoPermissionService.canCreate(player)) {
+            VideoUsagePolicy.audit(player, "-", "create", false);
             player.sendSystemMessage(Component.translatable(
                     "message.video_synchronizer.selection_tool.permission"));
             return InteractionResult.FAIL;
@@ -49,15 +55,26 @@ public final class ScreenSelectionToolItem extends Item {
         ItemStack stack = context.getItemInHand();
         if (player.isSecondaryUseActive()) {
             clearSelection(stack);
+            ServerScreenRegistry.clearPendingSelection(player.getUUID());
             player.sendSystemMessage(Component.translatable(
                     "message.video_synchronizer.selection_tool.cleared"));
             return InteractionResult.SUCCESS;
         }
 
-        BlockPos screenPos = context.getClickedPos().relative(context.getClickedFace());
+        BlockPos screenPos = context.getClickedPos();
+        if (!(context.getLevel().getBlockState(screenPos).getBlock() instanceof ScreenBlock)) {
+            player.sendSystemMessage(Component.translatable(
+                    "message.video_synchronizer.selection_tool.panels_only"));
+            return InteractionResult.FAIL;
+        }
+        Direction facing = context.getLevel().getBlockState(screenPos)
+                .getValue(ScreenBlock.FACING);
+        Direction screenUp = context.getLevel().getBlockState(screenPos)
+                .getValue(ScreenBlock.SCREEN_UP);
         Selection selection = selection(stack);
         if (selection == null) {
-            storeSelection(stack, player, screenPos, context.getClickedFace());
+            ServerScreenRegistry.clearPendingSelection(player.getUUID());
+            storeSelection(stack, player, screenPos, facing, screenUp);
             player.sendSystemMessage(Component.translatable(
                     "message.video_synchronizer.selection_tool.first",
                     screenPos.toShortString()));
@@ -65,12 +82,13 @@ public final class ScreenSelectionToolItem extends Item {
         }
 
         try {
-            BlockPos anchor = ScreenCreator.createSelection(player, selection.pos,
+            ScreenCreator.createSelection(player, selection.pos,
                     screenPos, selection.facing, selection.screenUp, selection.dimension,
-                    context.getClickedFace());
+                    facing);
+            ServerScreenRegistry.authorizeSelection(player, selection.pos, screenPos);
             clearSelection(stack);
             VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
-                    new OpenScreenBindingMessage(anchor, ""));
+                    new OpenScreenBindingMessage(selection.pos, screenPos, ""));
             player.sendSystemMessage(Component.translatable(
                     "message.video_synchronizer.selection_tool.created"));
             return InteractionResult.SUCCESS;
@@ -78,7 +96,7 @@ public final class ScreenSelectionToolItem extends Item {
             player.sendSystemMessage(exception.component().copy().withStyle(ChatFormatting.RED));
             return InteractionResult.FAIL;
         } catch (IllegalArgumentException exception) {
-            player.sendSystemMessage(Component.literal(exception.getMessage())
+            player.sendSystemMessage(LocalizedArgumentException.component(exception).copy()
                     .withStyle(ChatFormatting.RED));
             return InteractionResult.FAIL;
         }
@@ -104,13 +122,13 @@ public final class ScreenSelectionToolItem extends Item {
     }
 
     private static void storeSelection(ItemStack stack, ServerPlayer player, BlockPos pos,
-                                       Direction facing) {
+                                       Direction facing, Direction screenUp) {
         CompoundTag selection = new CompoundTag();
         selection.putLong(POS_TAG, pos.asLong());
         selection.putString(DIMENSION_TAG,
                 player.serverLevel().dimension().location().toString());
         selection.putByte(FACING_TAG, (byte) facing.get3DDataValue());
-        selection.putByte(SCREEN_UP_TAG, (byte) player.getDirection().get3DDataValue());
+        selection.putByte(SCREEN_UP_TAG, (byte) screenUp.get3DDataValue());
         stack.getOrCreateTag().put(SELECTION_TAG, selection);
     }
 

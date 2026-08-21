@@ -13,6 +13,7 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.network.PacketDistributor;
 import org.arkcraft.video_synchronizer.Main;
+import org.arkcraft.video_synchronizer.LocalizedArgumentException;
 import org.arkcraft.video_synchronizer.block.ScreenBlock;
 import org.arkcraft.video_synchronizer.block.ScreenBlockEntity;
 import org.arkcraft.video_synchronizer.block.ScreenLayout;
@@ -21,6 +22,7 @@ import org.arkcraft.video_synchronizer.block.VideoManagerBlockEntity;
 import org.arkcraft.video_synchronizer.network.MediaRequestOptions;
 import org.arkcraft.video_synchronizer.network.AudioPlaybackMode;
 import org.arkcraft.video_synchronizer.network.HttpStatusDescriptions;
+import org.arkcraft.video_synchronizer.network.OpenPlaybackConsentMessage;
 import org.arkcraft.video_synchronizer.network.VideoLocalPauseMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
@@ -72,27 +74,30 @@ public final class ServerVideoSessionManager {
     private ServerVideoSessionManager() {
     }
 
-    public static void start(MinecraftServer server, String videoId, String url) {
+    public static void start(MinecraftServer server, String videoId, String url,
+                             String initiatedBy, UUID initiatedById) {
         validateVideoId(videoId);
         validateMediaUrl(url);
         if (pendingDefaultTarget != null && pendingDefaultTarget.screenId != null) {
             Session existing = findSession(pendingDefaultTarget.screenId);
             if (existing != null && existing != SESSIONS.get(DEFAULT_SESSION_KEY)) {
-                throw new IllegalArgumentException("Screen already has an active video: "
-                        + pendingDefaultTarget.screenId);
+                throw new LocalizedArgumentException(
+                        "message.video_synchronizer.error.screen_active",
+                        pendingDefaultTarget.screenId);
             }
         }
         startValidated(server, DEFAULT_SESSION_KEY, videoId, url, "",
                 MediaRequestOptions.EMPTY, false, 0, VideoPixelFormat.RGB24,
                 VideoManagerBlockEntity.DEFAULT_AUDIO_RANGE, AudioPlaybackMode.POSITIONAL,
-                pendingDefaultTarget);
+                pendingDefaultTarget, initiatedBy, initiatedById, DEFAULT_SESSION_KEY);
     }
 
     public static void startForScreen(MinecraftServer server, String requestedScreenId,
                                       String videoUrl, String audioUrl, String requestHeaders,
                                       String cookie, boolean disableScaling, int videoPipeLanes,
                                       VideoPixelFormat videoPixelFormat, double audioRange,
-                                      AudioPlaybackMode audioPlaybackMode) {
+                                      AudioPlaybackMode audioPlaybackMode,
+                                      String initiatedBy, UUID initiatedById) {
         String screenId = ServerScreenRegistry.normalizeId(requestedScreenId);
         validateVideoId(screenId);
         validateMediaUrl(videoUrl);
@@ -102,17 +107,17 @@ public final class ServerVideoSessionManager {
         ServerScreenRegistry.ScreenReference reference = ServerScreenRegistry.require(server, screenId);
         ServerLevel level = server.getLevel(reference.dimension());
         if (level == null) {
-            throw new IllegalArgumentException("Screen dimension is not loaded: " + screenId);
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.dimension_unloaded", screenId);
         }
         Session existing = findSession(screenId);
-        if (existing != null) {
-            stopSessionKey(sessionKey(existing));
-        }
+        String replacingSessionKey = existing == null ? null : sessionKey(existing);
         Target target = target(level, reference.pos(), screenId);
         startValidated(server, screenId, screenId, videoUrl, audioUrl,
                 new MediaRequestOptions(requestHeaders, cookie), disableScaling,
                 videoPipeLanes, videoPixelFormat, validateAudioRange(audioRange),
-                requireAudioPlaybackMode(audioPlaybackMode), target);
+                requireAudioPlaybackMode(audioPlaybackMode), target, initiatedBy,
+                initiatedById, replacingSessionKey);
     }
 
     private static void startValidated(MinecraftServer server, String key, String videoId,
@@ -120,13 +125,25 @@ public final class ServerVideoSessionManager {
                                        MediaRequestOptions options, boolean disableScaling,
                                        int videoPipeLanes, VideoPixelFormat pixelFormat,
                                        double audioRange, AudioPlaybackMode audioPlaybackMode,
-                                       Target target) {
+                                       Target target, String initiatedBy, UUID initiatedById,
+                                       String replacingSessionKey) {
+        if (initiatedById != null) {
+            ServerPlayer player = server.getPlayerList().getPlayer(initiatedById);
+            if (player != null) {
+                VideoUsagePolicy.requirePlaybackStart(player, replacingSessionKey);
+            }
+        }
+        if (replacingSessionKey != null && !replacingSessionKey.equals(key)) {
+            stopSession(replacingSessionKey);
+        }
         stopSession(key);
-        Session session = new Session(UUID.randomUUID().toString(), videoId, videoUrl, audioUrl,
+        Session session = new Session(server, UUID.randomUUID().toString(), videoId,
+                videoUrl, audioUrl, normalizeInitiator(initiatedBy), initiatedById,
                 options, disableScaling, videoPipeLanes,
                 pixelFormat == null ? VideoPixelFormat.RGB24 : pixelFormat,
                 audioRange, audioPlaybackMode,
                 false, false, true, 1L, System.nanoTime(), target);
+        refreshPlaybackConsents(server, session);
         SESSIONS.put(key, session);
         refreshEligiblePlayers(server, session);
         session.waitingForClients = !session.eligiblePlayers.isEmpty();
@@ -168,8 +185,9 @@ public final class ServerVideoSessionManager {
         return session != null && seek(server, session, positionMs);
     }
 
-    public static void seekForScreen(MinecraftServer server, String screenId, long positionMs) {
-        seek(server, requireSession(screenId), positionMs);
+    public static boolean seekForScreen(MinecraftServer server, String screenId,
+                                        long positionMs) {
+        return seek(server, requireSession(screenId), positionMs);
     }
 
     private static boolean seek(MinecraftServer server, Session session, long positionMs) {
@@ -204,6 +222,27 @@ public final class ServerVideoSessionManager {
         stopSession(requireSessionKey(screenId));
     }
 
+    public static void stopIfPresent(String screenId) {
+        Session session = findSession(screenId);
+        if (session != null) {
+            stopSession(sessionKey(session));
+        }
+    }
+
+    public static int activeSessionsStartedBy(UUID playerId, String replacingSessionKey) {
+        if (playerId == null) {
+            return 0;
+        }
+        int count = 0;
+        for (Map.Entry<String, Session> entry : SESSIONS.entrySet()) {
+            if (!entry.getKey().equals(replacingSessionKey)
+                    && playerId.equals(entry.getValue().initiatedById)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     private static void stopSession(String key) {
         Session session = SESSIONS.remove(key);
         if (session != null) {
@@ -221,19 +260,21 @@ public final class ServerVideoSessionManager {
         }
         session.target = target;
         pendingDefaultTarget = target;
-        broadcastTarget(session);
+        refreshSessionAudience(server, session);
     }
 
     public static void bindScreen(MinecraftServer server, String requestedId) {
         String screenId = ServerScreenRegistry.normalizeId(requestedId);
         Session existing = findSession(screenId);
         if (existing != null && existing != SESSIONS.get(DEFAULT_SESSION_KEY)) {
-            throw new IllegalArgumentException("Screen already has an active video: " + screenId);
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.screen_active", screenId);
         }
         ServerScreenRegistry.ScreenReference reference = ServerScreenRegistry.require(server, screenId);
         ServerLevel level = server.getLevel(reference.dimension());
         if (level == null) {
-            throw new IllegalArgumentException("Screen dimension is not loaded: " + screenId);
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.dimension_unloaded", screenId);
         }
         Session session = SESSIONS.get(DEFAULT_SESSION_KEY);
         if (session == null) {
@@ -242,7 +283,7 @@ public final class ServerVideoSessionManager {
         }
         session.target = target(level, reference.pos(), screenId);
         pendingDefaultTarget = session.target;
-        broadcastTarget(session);
+        refreshSessionAudience(server, session);
     }
 
     public static void unbindScreen(MinecraftServer server) {
@@ -250,7 +291,7 @@ public final class ServerVideoSessionManager {
         Session session = SESSIONS.get(DEFAULT_SESSION_KEY);
         if (session != null) {
             session.target = null;
-            broadcastTarget(session);
+            refreshSessionAudience(server, session);
         }
     }
 
@@ -268,6 +309,11 @@ public final class ServerVideoSessionManager {
                 session.audioRange, session.audioPlaybackMode,
                 positionAt(session, System.nanoTime()), session.durationMs,
                 session.live, session.playing, session.waitingForClients);
+    }
+
+    public static String playbackInitiator(String screenId) {
+        Session session = findSession(screenId);
+        return session == null ? "" : session.initiatedBy;
     }
 
     public static boolean isPlaybackProtected(ServerLevel level, BlockPos pos) {
@@ -423,7 +469,8 @@ public final class ServerVideoSessionManager {
     public static void acceptPlaybackError(MinecraftServer server, ServerPlayer player,
                                            VideoPlaybackErrorMessage message) {
         Session session = sessionById(message.sessionId());
-        if (session == null || !PLAYBACK_CAPABLE_PLAYERS.contains(player.getUUID())) {
+        if (session == null || !PLAYBACK_CAPABLE_PLAYERS.contains(player.getUUID())
+                || !isEligibleForSession(player, session)) {
             return;
         }
         Component notice;
@@ -446,10 +493,12 @@ public final class ServerVideoSessionManager {
                 session.sessionId, message.reason(), message.statusCode());
         stopSessionKey(sessionKey(session));
         if (message.reason() == VideoPlaybackErrorMessage.Reason.HTTP_ERROR) {
-            server.getPlayerList().getPlayers().forEach(onlinePlayer ->
-                    onlinePlayer.sendSystemMessage(notice));
+            server.getPlayerList().getPlayers().stream()
+                    .filter(onlinePlayer -> canReceivePlayback(
+                            session, onlinePlayer.getUUID()))
+                    .forEach(onlinePlayer -> onlinePlayer.sendSystemMessage(notice));
         } else {
-            VideoNetwork.CHANNEL.send(PacketDistributor.ALL.noArg(),
+            sendToPlaybackAudience(session,
                     new VideoPlaybackNoticeMessage(session.videoId, message.reason()));
         }
     }
@@ -514,13 +563,17 @@ public final class ServerVideoSessionManager {
 
     public static void setPlayerWeight(UUID playerId, double weight) {
         if (!Double.isFinite(weight)) {
-            throw new IllegalArgumentException("weight must be finite");
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.weight_finite");
         }
         PLAYER_WEIGHTS.put(playerId, Math.max(MIN_WEIGHT, Math.min(MAX_WEIGHT, weight)));
     }
 
     public static void sendCurrent(ServerPlayer player) {
         for (Session session : SESSIONS.values()) {
+            if (!canReceivePlayback(session, player.getUUID())) {
+                continue;
+            }
             session.reports.remove(player.getUUID());
             if (!session.live && session.eligiblePlayers.contains(player.getUUID())) {
                 session.joinConfirmations.put(player.getUUID(), 0);
@@ -535,6 +588,43 @@ public final class ServerVideoSessionManager {
         }
     }
 
+    public static void playbackConsentChanged(MinecraftServer server, ServerPlayer player,
+                                              String screenId, boolean allowed) {
+        playbackConsentChanged(server, player.getUUID(), screenId, allowed);
+    }
+
+    public static void playbackConsentChanged(MinecraftServer server, UUID playerId,
+                                              String screenId, boolean allowed) {
+        String normalizedScreenId = ServerScreenRegistry.normalizeId(screenId);
+        Session session = findSession(normalizedScreenId);
+        if (session == null || session.target == null
+                || !normalizedScreenId.equals(session.target.screenId)) {
+            return;
+        }
+        ServerPlayer player = server.getPlayerList().getPlayer(playerId);
+        if (allowed) {
+            session.approvedViewers.add(playerId);
+            refreshEligiblePlayers(server, session);
+            if (player != null) {
+                sendCurrent(player, session);
+            }
+        } else {
+            session.approvedViewers.remove(playerId);
+            session.reports.remove(playerId);
+            session.readyDurations.remove(playerId);
+            session.readyLiveStreams.remove(playerId);
+            session.joinConfirmations.remove(playerId);
+            session.eligiblePlayers.remove(playerId);
+            if (player != null) {
+                VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
+                        new VideoStopMessage(session.sessionId));
+            }
+            if (session.waitingForClients) {
+                tryBeginPlayback(server, session);
+            }
+        }
+    }
+
     public static void reset() {
         SESSIONS.clear();
         PLAYBACK_CAPABLE_PLAYERS.clear();
@@ -543,6 +633,7 @@ public final class ServerVideoSessionManager {
         STATUS_BOSS_BARS.clear();
         pendingDefaultTarget = null;
         serverTick = 0L;
+        VideoUsagePolicy.reset();
     }
 
     public static boolean toggleStatusBossBar(ServerPlayer player) {
@@ -570,7 +661,18 @@ public final class ServerVideoSessionManager {
                     "command.video_synchronizer.status.none").withStyle(ChatFormatting.GRAY));
         }
         long nowNanos = System.nanoTime();
+        int visibleSessions = 0;
         for (Session session : SESSIONS.values()) {
+            if (viewer != null && session.target != null
+                    && session.target.screenId != null
+                    && !session.target.screenId.isBlank()) {
+                VideoScreenSavedData.ScreenRecord screen = ServerScreenRegistry.find(
+                        server, session.target.screenId).orElse(null);
+                if (screen != null && !VideoPermissionService.canViewStatus(viewer, screen)) {
+                    continue;
+                }
+            }
+            visibleSessions++;
             refreshEligiblePlayers(server, session);
             long serverPosition = positionAt(session, nowNanos);
             result = result.copy().append("\n").append(Component.translatable(
@@ -650,6 +752,10 @@ public final class ServerVideoSessionManager {
             result = result.copy().append("\n").append(Component.translatable(
                     "command.video_synchronizer.status.local", formatTime(localPosition),
                     drift, reportAge, playbackStateComponent(report.playing, false)));
+        }
+        if (visibleSessions == 0) {
+            return result.copy().append("\n").append(Component.translatable(
+                    "command.video_synchronizer.status.none").withStyle(ChatFormatting.GRAY));
         }
         return result;
     }
@@ -857,7 +963,7 @@ public final class ServerVideoSessionManager {
 
     private static void broadcastStart(Session session) {
         long nowNanos = System.nanoTime();
-        VideoNetwork.CHANNEL.send(PacketDistributor.ALL.noArg(), startMessage(session, nowNanos));
+        sendToPlaybackAudience(session, startMessage(session, nowNanos));
         broadcastTarget(session);
     }
 
@@ -871,7 +977,7 @@ public final class ServerVideoSessionManager {
     }
 
     private static void broadcastTarget(Session session) {
-        VideoNetwork.CHANNEL.send(PacketDistributor.ALL.noArg(), targetMessage(session));
+        sendToPlaybackAudience(session, targetMessage(session));
     }
 
     private static VideoScreenTargetMessage targetMessage(Session session) {
@@ -889,10 +995,57 @@ public final class ServerVideoSessionManager {
 
     private static void broadcastState(Session session, boolean hardSeek) {
         long nowNanos = System.nanoTime();
-        VideoNetwork.CHANNEL.send(PacketDistributor.ALL.noArg(), new VideoStateMessage(
+        sendToPlaybackAudience(session, new VideoStateMessage(
                 session.sessionId, positionAt(session, nowNanos), session.durationMs,
                 session.live, session.playing, session.waitingForClients,
                 hardSeek, session.revision, nowNanos));
+    }
+
+    private static void sendToPlaybackAudience(Session session, Object message) {
+        for (ServerPlayer player : session.server.getPlayerList().getPlayers()) {
+            if (canReceivePlayback(session, player.getUUID())) {
+                VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), message);
+            }
+        }
+    }
+
+    private static boolean canReceivePlayback(Session session, UUID playerId) {
+        return session.target == null || session.target.screenId == null
+                || session.target.screenId.isBlank()
+                || session.approvedViewers.contains(playerId);
+    }
+
+    private static void sendCurrent(ServerPlayer player, Session session) {
+        long nowNanos = System.nanoTime();
+        VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
+                startMessage(session, nowNanos));
+        VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
+                targetMessage(session));
+    }
+
+    private static void refreshPlaybackConsents(MinecraftServer server, Session session) {
+        session.approvedViewers.clear();
+        if (session.target != null && session.target.screenId != null
+                && !session.target.screenId.isBlank()) {
+            session.approvedViewers.addAll(ServerScreenRegistry.playbackConsents(
+                    server, session.target.screenId));
+        }
+    }
+
+    private static void refreshSessionAudience(MinecraftServer server, Session session) {
+        refreshPlaybackConsents(server, session);
+        refreshEligiblePlayers(server, session);
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (canReceivePlayback(session, player.getUUID())) {
+                sendCurrent(player, session);
+            } else {
+                VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
+                        new VideoStopMessage(session.sessionId));
+            }
+        }
+        if (session.waitingForClients) {
+            tryBeginPlayback(server, session);
+        }
     }
 
     private static boolean periodicBroadcastReady(Session session) {
@@ -909,7 +1062,8 @@ public final class ServerVideoSessionManager {
         String key = requireSessionKey(requestedScreenId);
         Session session = SESSIONS.get(key);
         if (session == null) {
-            throw new IllegalArgumentException("There is no active video for screen " + requestedScreenId);
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.no_active_video", requestedScreenId);
         }
         return session;
     }
@@ -924,7 +1078,8 @@ public final class ServerVideoSessionManager {
                 return entry.getKey();
             }
         }
-        throw new IllegalArgumentException("There is no active video for screen " + id);
+        throw new LocalizedArgumentException(
+                "message.video_synchronizer.error.no_active_video", id);
     }
 
     private static Session findSession(String screenId) {
@@ -1003,6 +1158,9 @@ public final class ServerVideoSessionManager {
     }
 
     private static boolean isEligibleForSession(ServerPlayer player, Session session) {
+        if (!canReceivePlayback(session, player.getUUID())) {
+            return false;
+        }
         if (session.audioPlaybackMode != AudioPlaybackMode.POSITIONAL
                 || session.target == null) {
             return true;
@@ -1052,8 +1210,16 @@ public final class ServerVideoSessionManager {
     }
 
     private static Target target(ServerLevel level, BlockPos pos, String screenId) {
+        VideoScreenSavedData.ScreenRecord record = ServerScreenRegistry.find(
+                level.getServer(), screenId).orElse(null);
+        if (record != null) {
+            return new Target(record.dimension(), record.displayId(), record.origin(),
+                    new ScreenLayout(0, 0, record.width(), record.height()),
+                    record.facing(), record.screenUp());
+        }
         if (!(level.getBlockState(pos).getBlock() instanceof ScreenBlock)) {
-            throw new IllegalArgumentException("The target position is not a video screen");
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.target_not_screen");
         }
         ScreenLayout layout = ScreenLayout.SINGLE;
         if (level.getBlockEntity(pos) instanceof ScreenBlockEntity screen) {
@@ -1070,7 +1236,7 @@ public final class ServerVideoSessionManager {
 
     private static String screenId(ServerLevel level, BlockPos pos) {
         return level.getBlockEntity(pos) instanceof ScreenBlockEntity screen
-                ? screen.getScreenId() : null;
+                ? ServerScreenRegistry.screenId(level, screen) : null;
     }
 
     private static int dot(int dx, int dy, int dz, Direction direction) {
@@ -1080,39 +1246,54 @@ public final class ServerVideoSessionManager {
 
     private static void validateVideoId(String videoId) {
         if (videoId == null || videoId.isBlank() || videoId.length() > 256) {
-            throw new IllegalArgumentException("Video id must be 1-256 characters");
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.video_id_format");
         }
     }
 
     public static void validateMediaUrl(String value) {
         if (value == null) {
-            throw new IllegalArgumentException("Invalid media URL");
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.media_url_invalid");
         }
         try {
             URI uri = new URI(value);
             if (!("http".equalsIgnoreCase(uri.getScheme())
                     || "https".equalsIgnoreCase(uri.getScheme()))
                     || uri.getHost() == null || value.length() > 2048) {
-                throw new IllegalArgumentException(
-                        "Only absolute HTTP(S) media URLs are supported");
+                throw new LocalizedArgumentException(
+                        "message.video_synchronizer.error.media_url_http");
             }
+            VideoUsagePolicy.validateMediaUri(uri);
         } catch (URISyntaxException exception) {
-            throw new IllegalArgumentException("Invalid media URL", exception);
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.media_url_invalid");
         }
     }
 
     public static double validateAudioRange(double value) {
         if (!Double.isFinite(value) || value < MIN_AUDIO_RANGE || value > MAX_AUDIO_RANGE) {
-            throw new IllegalArgumentException("Audio range must be between 1 and 1024 blocks");
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.audio_range",
+                    (int) MIN_AUDIO_RANGE, (int) MAX_AUDIO_RANGE);
         }
         return value;
     }
 
     private static AudioPlaybackMode requireAudioPlaybackMode(AudioPlaybackMode mode) {
         if (mode == null) {
-            throw new IllegalArgumentException("Audio playback mode is required");
+            throw new LocalizedArgumentException(
+                    "message.video_synchronizer.error.audio_mode_required");
         }
         return mode;
+    }
+
+    private static String normalizeInitiator(String initiatedBy) {
+        if (initiatedBy == null || initiatedBy.isBlank()) {
+            return OpenPlaybackConsentMessage.SERVER_INITIATOR;
+        }
+        String trimmed = initiatedBy.trim();
+        return trimmed.length() <= 64 ? trimmed : trimmed.substring(0, 64);
     }
 
     private static Component playbackStateComponent(boolean playing, boolean waiting) {
@@ -1165,10 +1346,13 @@ public final class ServerVideoSessionManager {
     }
 
     private static final class Session {
+        private final MinecraftServer server;
         private final String sessionId;
         private final String videoId;
         private final String videoUrl;
         private final String audioUrl;
+        private final String initiatedBy;
+        private final UUID initiatedById;
         private final MediaRequestOptions requestOptions;
         private final boolean disableScaling;
         private final int videoPipeLanes;
@@ -1192,17 +1376,22 @@ public final class ServerVideoSessionManager {
         private final Map<UUID, Long> readyDurations = new HashMap<>();
         private final Map<UUID, Boolean> readyLiveStreams = new HashMap<>();
         private final Set<UUID> eligiblePlayers = new HashSet<>();
+        private final Set<UUID> approvedViewers = new HashSet<>();
 
-        private Session(String sessionId, String videoId, String videoUrl, String audioUrl,
+        private Session(MinecraftServer server, String sessionId, String videoId,
+                        String videoUrl, String audioUrl, String initiatedBy, UUID initiatedById,
                         MediaRequestOptions requestOptions, boolean disableScaling,
                         int videoPipeLanes, VideoPixelFormat videoPixelFormat,
                         double audioRange, AudioPlaybackMode audioPlaybackMode,
                         boolean playing, boolean waitingForClients, boolean playWhenReady,
                         long revision, long positionNanos, Target target) {
+            this.server = server;
             this.sessionId = sessionId;
             this.videoId = videoId;
             this.videoUrl = videoUrl;
             this.audioUrl = audioUrl;
+            this.initiatedBy = initiatedBy;
+            this.initiatedById = initiatedById;
             this.requestOptions = requestOptions;
             this.disableScaling = disableScaling;
             this.videoPipeLanes = videoPipeLanes;
