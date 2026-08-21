@@ -1058,6 +1058,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 }
                 if (discardUntilMs >= 0L
                         && videoDiscardUntilMs.compareAndSet(discardUntilMs, -1L)) {
+                    audioPlayback.completeSoftForward(discardUntilMs);
                     Main.LOGGER.debug("Video soft-forward caught up: frame={} ms, target={} ms",
                             framePosition, discardUntilMs);
                 }
@@ -2695,7 +2696,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             return thread;
         });
         private final AtomicLong audioRequestedSeekMs = new AtomicLong(-1L);
-        private final AtomicLong forwardDiscardUntilMs = new AtomicLong(-1L);
+        private final AtomicLong softForwardTargetMs = new AtomicLong(-1L);
 
         private Process audioProcess;
         private Process pendingAudioProcess;
@@ -2717,7 +2718,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             audioEstablished = false;
             reconnecting = false;
             lastOutputProgressNanos = 0L;
-            forwardDiscardUntilMs.set(-1L);
+            softForwardTargetMs.set(-1L);
             audioRequestedSeekMs.set(startPositionMs);
             startWorkerLocked();
         }
@@ -2728,7 +2729,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             Main.LOGGER.debug("Seeking synchronized audio: generation={}, position={} ms",
                     activeGeneration, positionMs);
-            forwardDiscardUntilMs.set(-1L);
+            softForwardTargetMs.set(-1L);
             audioRequestedSeekMs.set(positionMs);
             destroyAudioProcessLocked();
             startWorkerLocked();
@@ -2835,7 +2836,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             } else {
                 activatedSeekPreparation = preparation;
             }
-            forwardDiscardUntilMs.set(-1L);
+            softForwardTargetMs.set(-1L);
             audioRequestedSeekMs.set(positionMs);
             destroyAudioProcessLocked();
             startWorkerLocked();
@@ -2861,7 +2862,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             audioEstablished = false;
             reconnecting = false;
             lastOutputProgressNanos = 0L;
-            forwardDiscardUntilMs.set(-1L);
+            softForwardTargetMs.set(-1L);
             audioRequestedSeekMs.set(-1L);
             destroyAudioProcessLocked();
             cancelPreparedSeek();
@@ -3077,7 +3078,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             long lineBasePositionMs = decoderStartPosition;
             boolean submittedAudio = false;
             boolean lineRunning = false;
-            long activeForwardTargetMs = -1L;
             long nextVolumeUpdateNanos = 0L;
             float appliedVolume = Float.NaN;
             long statsStartNanos = System.nanoTime();
@@ -3092,21 +3092,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     if (audioRequestedSeekMs.get() >= 0L) {
                         return AudioDecodeResult.SEEK_REQUESTED;
                     }
-                    long requestedForwardTargetMs = forwardDiscardUntilMs.getAndSet(-1L);
-                    if (requestedForwardTargetMs >= 0L) {
-                        if (lineRunning) {
-                            line.stop();
-                            lineRunning = false;
-                        }
-                        line.flush();
-                        submittedAudio = false;
-                        activeForwardTargetMs = requestedForwardTargetMs;
-                        Main.LOGGER.debug("Audio soft-forward started: target={} ms",
-                                activeForwardTargetMs);
-                    }
-                    boolean discardingForward = activeForwardTargetMs >= 0L;
-                    if (clientPaused || (!playing && !discardingForward)
-                            || (!clockStarted && !discardingForward)) {
+                    boolean softForwardPending = softForwardTargetMs.get() >= 0L;
+                    if (clientPaused || !playing
+                            || (!clockStarted && !softForwardPending)) {
                         if (lineRunning) {
                             line.stop();
                             lineRunning = false;
@@ -3157,21 +3145,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     decodedFrames += framesRead;
                     long chunkEndMs = decoderStartPosition
                             + decodedFrames * 1000L / AUDIO_SAMPLE_RATE;
-
-                    if (activeForwardTargetMs >= 0L
-                            && chunkEndMs <= activeForwardTargetMs) {
-                        statsDiscardedChunks++;
-                        continue;
-                    }
-                    if (activeForwardTargetMs >= 0L && (!playing || !clockStarted)) {
-                        decodedFrames -= framesRead;
-                        statsBytes -= bytesRead;
-                        statsChunks--;
-                        preparedChunkBytes = bytesRead;
-                        activeForwardTargetMs = -1L;
-                        continue;
-                    }
-                    activeForwardTargetMs = -1L;
 
                     // Align only before starting the output line. Once playback begins,
                     // SourceDataLine must stay fed continuously to avoid audible underruns.
@@ -3613,7 +3586,17 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         }
 
         private void skipForward(long positionMs) {
-            forwardDiscardUntilMs.set(positionMs);
+            softForwardTargetMs.set(positionMs);
+            Main.LOGGER.debug("Deferring synchronized audio switch until video catches up: "
+                            + "target={} ms", positionMs);
+        }
+
+        private synchronized void completeSoftForward(long positionMs) {
+            if (softForwardTargetMs.compareAndSet(positionMs, -1L)) {
+                Main.LOGGER.debug("Video caught up; switching synchronized audio at {} ms",
+                        positionMs);
+                seek(positionMs);
+            }
         }
 
         private void closePreparedAudioDecoder(PreparedAudioDecoder prepared) {

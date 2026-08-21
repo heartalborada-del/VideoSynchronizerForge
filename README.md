@@ -77,6 +77,8 @@ Managers keeps those screen sessions independent.
   media, then automatically retry with full analysis when the quick result is incomplete.
 - If audio or video stalls, both streams recover together. On-demand media restarts from
   its synchronized position; live media reconnects at the current live edge.
+- During small forward synchronization corrections, current audio continues until video
+  reaches the target, then audio restarts from the synchronized position.
 - If FFmpeg receives HTTP 403, it retries from the session's original URL up to five times
   before reporting the HTTP error.
 - `/video sync` is a client-only command that stops local video and audio, requests the
