@@ -108,7 +108,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static final long VIDEO_CATCH_UP_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(5L);
     private static final long SEEK_PREPARE_TIMEOUT_MS = 5_000L;
     private static final long SEEK_REPLACE_THRESHOLD_MS = 2_000L;
-    private static final long SOFT_FORWARD_SEEK_MAX_MS = 10_000L;
     private static final Pattern HTTP_STATUS_PATTERN = Pattern.compile(
             "(?i)(?:\\bHTTP\\s+(?:error\\s+)?|\\bserver\\s+returned\\s+)"
                     + "([1-9][0-9]{2})\\b");
@@ -133,7 +132,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             });
     private final AtomicLong generation = new AtomicLong();
     private final AtomicLong requestedSeekMs = new AtomicLong(-1L);
-    private final AtomicLong videoDiscardUntilMs = new AtomicLong(-1L);
     private final AtomicLong seekPreparationGeneration = new AtomicLong();
     private final AtomicLong reportedPlaybackErrorGeneration = new AtomicLong(-1L);
     private final String sessionId;
@@ -265,7 +263,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         String sessionAudioUrl = this.activeAudioUrl;
         this.preferredDecodeMode = null;
         cancelPreparedSeek();
-        this.videoDiscardUntilMs.set(-1L);
         this.requestedSeekMs.set(0L);
         executor.execute(() -> runSession(sessionGeneration, videoUrl, sessionAudioUrl));
     }
@@ -303,29 +300,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             Main.LOGGER.debug("Resuming live playback at the current stream edge");
             return;
         }
-        long forwardDistanceMs = boundedPosition - currentPosition;
-        if (hardSeek && decoderProcess && clockStarted
-                && (playing || waitingForClients)
-                && forwardDistanceMs > 0L
-                && forwardDistanceMs <= SOFT_FORWARD_SEEK_MAX_MS) {
-            cancelPreparedSeek();
-            long nowNanos = System.nanoTime();
-            this.anchorPositionMs = boundedPosition;
-            this.anchorNanos = nowNanos;
-            this.playing = playing;
-            if (waitingForClients) {
-                clockStarted = false;
-            }
-            videoDiscardUntilMs.set(boundedPosition);
-            frameBuffer.clear();
-            audioPlayback.skipForward(boundedPosition);
-            Main.LOGGER.debug("Soft-forwarding synchronized playback: current={} ms, "
-                            + "target={} ms, distance={} ms",
-                    currentPosition, boundedPosition, forwardDistanceMs);
-            return;
-        }
         if (hardSeek && canPrepareSeek()) {
-            videoDiscardUntilMs.set(-1L);
             if (playbackStateChanged) {
                 this.anchorPositionMs = currentPosition;
                 this.anchorNanos = System.nanoTime();
@@ -345,7 +320,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             Main.LOGGER.debug("Scheduling hard video seek to {} ms and terminating active decoder",
                     boundedPosition);
             clockStarted = false;
-            videoDiscardUntilMs.set(-1L);
             frameBuffer.clear();
             requestedSeekMs.set(boundedPosition);
             destroyDecoderProcess();
@@ -545,7 +519,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         lastCatchUpSeekNanos = 0L;
         spatialAudioState = SpatialAudioState.SILENT;
         requestedSeekMs.set(-1L);
-        videoDiscardUntilMs.set(-1L);
         cancelPreparedSeek();
         destroyProcess();
         audioPlayback.close();
@@ -608,8 +581,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     limitsFrameRate ? "limited to 60 fps" : "passthrough",
                     metadata.hasAudio || separateAudioUrl != null ? "enabled" : "not present",
                     liveStream);
+            boolean sharedAudioDecoder = metadata.hasAudio && separateAudioUrl == null;
             String audioMediaUrl = separateAudioUrl == null ? mediaUrl : separateAudioUrl;
-            if (metadata.hasAudio || separateAudioUrl != null) {
+            if (!sharedAudioDecoder && (metadata.hasAudio || separateAudioUrl != null)) {
                 audioPlayback.open(sessionGeneration, audioMediaUrl, positionMs());
             }
             long startPosition = nextVideoStartPosition();
@@ -824,6 +798,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 Math.multiplyExact(outputDimensions.width, outputDimensions.height),
                 pixelFormat.bytesPerPixel());
         StripedVideoOutput stripedOutput = null;
+        SharedAudioOutput sharedAudioOutput = preparedDecoder == null
+                && activeAudioUrl == null && metadata.hasAudio
+                ? SharedAudioOutput.create() : null;
         int requestedPipeLanes = allowStripedOutput && preparedDecoder == null
                 ? effectiveVideoPipeLanes(frameSize, outputDimensions.height) : 1;
         if (requestedPipeLanes > 1) {
@@ -882,6 +859,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
         }
         addVideoOutputs(command, videoFilters, outputDimensions, stripedOutput, pixelFormat);
+        if (sharedAudioOutput != null) {
+            addSharedAudioOutput(command, sharedAudioOutput);
+        }
         Process decoder;
         ErrorCollector errors;
         InputStream decoderOutput;
@@ -898,15 +878,21 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 closePreparedVideoDecoder(preparedDecoder);
                 return DecodeResult.ENDED;
             }
+            if (preparedDecoder.sharedAudio != null) {
+                audioPlayback.openPreparedShared(sessionGeneration, decoder,
+                        decoderStartPosition, preparedDecoder.sharedAudio);
+            }
         } else {
             try {
                 decoder = EmbeddedFfmpeg.processBuilder(command).start();
             } catch (IOException exception) {
                 closeQuietly(stripedOutput);
+                closeQuietly(sharedAudioOutput);
                 throw exception;
             }
             if (!registerProcess(decoder, sessionGeneration, true)) {
                 closeQuietly(stripedOutput);
+                closeQuietly(sharedAudioOutput);
                 terminateProcessTree(decoder);
                 return DecodeResult.ENDED;
             }
@@ -929,6 +915,19 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             exception.getMessage());
                     return decode(mediaUrl, metadata, startPosition, sessionGeneration,
                             mode, null, false);
+                }
+            }
+            if (sharedAudioOutput != null) {
+                try {
+                    InputStream audioInput = sharedAudioOutput.accept(decoder);
+                    audioPlayback.openShared(sessionGeneration, audioInput, decoder,
+                            decoderStartPosition);
+                } catch (IOException exception) {
+                    closeQuietly(sharedAudioOutput);
+                    terminateProcessTree(decoder);
+                    errors.await();
+                    clearProcess(decoder);
+                    throw exception;
                 }
             }
         }
@@ -1031,11 +1030,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 }
 
                 long playbackPosition = positionMs();
-                long discardUntilMs = videoDiscardUntilMs.get();
-                long requiredFramePosition = discardUntilMs;
-                if (playing && (discardUntilMs >= 0L
-                        || (preparedDecoder != null && !clockStarted))) {
-                    requiredFramePosition = Math.max(playbackPosition, requiredFramePosition);
+                long requiredFramePosition = -1L;
+                if (playing && preparedDecoder != null && !clockStarted) {
+                    requiredFramePosition = playbackPosition;
                 }
                 if (requiredFramePosition >= 0L
                         && framePosition + 75L < requiredFramePosition) {
@@ -1056,16 +1053,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             + Math.round(decodedFrames * frameDurationMs);
                     continue;
                 }
-                if (discardUntilMs >= 0L
-                        && videoDiscardUntilMs.compareAndSet(discardUntilMs, -1L)) {
-                    audioPlayback.completeSoftForward(discardUntilMs);
-                    Main.LOGGER.debug("Video soft-forward caught up: frame={} ms, target={} ms",
-                            framePosition, discardUntilMs);
-                }
                 long catchUpNow = System.nanoTime();
                 long videoBehindMs = playbackPosition - framePosition;
                 if (!liveStream && clockStarted && playing && !clientPaused && !preloading
-                        && videoDiscardUntilMs.get() < 0L
                         && videoBehindMs >= VIDEO_CATCH_UP_THRESHOLD_MS
                         && catchUpNow - lastCatchUpSeekNanos
                         >= VIDEO_CATCH_UP_COOLDOWN_NANOS
@@ -1082,7 +1072,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
 
                 long pacingStartNanos = System.nanoTime();
                 boolean startingPreparedClock = !clockStarted
-                        && (preparedDecoder != null || discardUntilMs >= 0L);
+                        && preparedDecoder != null;
                 while (generation.get() == sessionGeneration && requestedSeekMs.get() < 0L
                         && !startingPreparedClock
                         && framePosition > positionMs() + 75L) {
@@ -1209,11 +1199,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         if (activeMetadata == null || activeMediaUrl == null || !decoderProcess) {
             return false;
         }
-        OutputDimensions output = outputDimensions(
-                activeMetadata.width, activeMetadata.height, disableScaling);
-        int frameSize = Math.multiplyExact(Math.multiplyExact(output.width, output.height),
-                activeVideoPixelFormat.bytesPerPixel());
-        return effectiveVideoPipeLanes(frameSize, output.height) == 1;
+        return true;
     }
 
     private synchronized void prepareSeek(long positionMs) {
@@ -1244,7 +1230,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         pendingSeekPositionMs = positionMs;
         pendingSeekRequestedNanos = System.nanoTime();
         pendingSeekPlaying = playing;
-        pendingSeekNeedsAudio = metadata.hasAudio || activeAudioUrl != null;
+        boolean preparesSharedAudio = activeAudioUrl == null && metadata.hasAudio;
+        pendingSeekNeedsAudio = !preparesSharedAudio
+                && (metadata.hasAudio || activeAudioUrl != null);
         pendingAudioFailed = false;
         Main.LOGGER.debug("Preparing synchronized seek: preparation={}, generation={}, "
                         + "position={} ms, audio={}",
@@ -1300,15 +1288,43 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             throws IOException, InterruptedException {
         long preparationStartedNanos = System.nanoTime();
         VideoCommand videoCommand = createVideoCommand(mediaUrl, metadata, positionMs, mode);
-        Process candidate = EmbeddedFfmpeg.processBuilder(videoCommand.command).start();
+        SharedAudioOutput sharedAudioOutput = activeAudioUrl == null && metadata.hasAudio
+                ? SharedAudioOutput.create() : null;
+        if (sharedAudioOutput != null) {
+            addSharedAudioOutput(videoCommand.command, sharedAudioOutput);
+        }
+        Process candidate;
+        try {
+            candidate = EmbeddedFfmpeg.processBuilder(videoCommand.command).start();
+        } catch (IOException exception) {
+            closeQuietly(sharedAudioOutput);
+            throw exception;
+        }
         long processSpawnNanos = System.nanoTime() - preparationStartedNanos;
         if (!registerPendingVideoProcess(candidate, preparation, sessionGeneration)) {
+            closeQuietly(sharedAudioOutput);
             terminateProcessTree(candidate);
             return null;
         }
         ErrorCollector errors = new ErrorCollector(candidate.getErrorStream());
         errors.start();
         InputStream output = candidate.getInputStream();
+        InputStream sharedAudioInput = null;
+        Future<PreparedSharedAudio> sharedAudioFuture = null;
+        if (sharedAudioOutput != null) {
+            try {
+                sharedAudioInput = sharedAudioOutput.accept(candidate);
+            } catch (IOException exception) {
+                closeQuietly(output);
+                closeQuietly(sharedAudioOutput);
+                terminateProcessTree(candidate);
+                errors.await();
+                clearPendingVideoProcess(candidate);
+                throw exception;
+            }
+            sharedAudioFuture = audioPlayback.prepareSharedAudio(
+                    preparation, sessionGeneration, sharedAudioInput);
+        }
         byte[] frame = frameBuffer.acquire(videoCommand.frameSize);
         int offset = 0;
         long firstByteNanos = -1L;
@@ -1334,6 +1350,18 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             failureReason = "complete";
             preferredDecodeMode = mode;
+            PreparedSharedAudio sharedAudio;
+            try {
+                sharedAudio = sharedAudioFuture == null ? null : sharedAudioFuture.get();
+            } catch (ExecutionException exception) {
+                offset = 0;
+                throw new IOException("Unable to prepare shared audio output", exception.getCause());
+            }
+            if (sharedAudioFuture != null && sharedAudio == null) {
+                failureReason = "audio-cancelled";
+                offset = 0;
+                return null;
+            }
             Main.LOGGER.debug("Prepared video seek decoder: preparation={}, pid={}, mode={}, "
                             + "position={} ms, frameBytes={}, processSpawn={} ms, "
                             + "firstByte={} ms, firstFrame={} ms",
@@ -1344,7 +1372,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     (System.nanoTime() - preparationStartedNanos) / 1_000_000.0D);
             return new PreparedVideoDecoder(preparation, positionMs, mode,
                     candidate, errors, output, frame, videoCommand.outputDimensions,
-                    videoCommand.pixelFormat);
+                    videoCommand.pixelFormat, sharedAudio);
         } finally {
             if (offset < frame.length) {
                 frameBuffer.release(new VideoFrameBuffer.DecodedFrame(
@@ -1352,6 +1380,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         videoCommand.outputDimensions.height, positionMs,
                         videoCommand.pixelFormat, frame));
                 output.close();
+                closeQuietly(sharedAudioInput);
+                closeQuietly(sharedAudioOutput);
                 terminateProcessTree(candidate);
                 errors.await();
                 clearPendingVideoProcess(candidate);
@@ -1423,7 +1453,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         anchorPositionMs = positionMs;
         anchorNanos = nowNanos;
         clockStarted = false;
-        videoDiscardUntilMs.set(-1L);
         frameBuffer.clear();
         activatedSeekPreparation = preparation;
         audioPlayback.activatePreparedSeek(preparation, positionMs,
@@ -1471,7 +1500,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         anchorPositionMs = positionMs;
         anchorNanos = System.nanoTime();
         clockStarted = false;
-        videoDiscardUntilMs.set(-1L);
         frameBuffer.clear();
         requestedSeekMs.set(positionMs);
         destroyDecoderProcess();
@@ -1600,6 +1628,23 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             command.add("rawvideo");
             command.add(stripedOutput.url(stripe.index()));
         }
+    }
+
+    private static void addSharedAudioOutput(List<String> command, SharedAudioOutput output) {
+        command.add("-map");
+        command.add("0:a:0");
+        command.add("-vn");
+        command.add("-sn");
+        command.add("-dn");
+        command.add("-af");
+        command.add("aresample=async=1:first_pts=0");
+        command.add("-ac");
+        command.add(Integer.toString(AUDIO_CHANNELS));
+        command.add("-ar");
+        command.add(Integer.toString(AUDIO_SAMPLE_RATE));
+        command.add("-f");
+        command.add("s16le");
+        command.add(output.url());
     }
 
     private VideoCommand createVideoCommand(String mediaUrl, VideoMetadata metadata,
@@ -2387,6 +2432,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             prepared.output.close();
         } catch (IOException ignored) {
         }
+        if (prepared.sharedAudio != null) {
+            closeQuietly(prepared.sharedAudio.input());
+        }
         terminateProcessTree(prepared.process);
         try {
             prepared.errors.await();
@@ -2453,6 +2501,59 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
 
     private record VideoPipeStripe(int index, int y, int height,
                                    int byteOffset, int byteLength) {
+    }
+
+    private static final class SharedAudioOutput implements AutoCloseable {
+        private final ServerSocket listener;
+        private Socket socket;
+
+        private SharedAudioOutput(ServerSocket listener) {
+            this.listener = listener;
+        }
+
+        private static SharedAudioOutput create() throws IOException {
+            ServerSocket listener = new ServerSocket();
+            try {
+                listener.setReuseAddress(true);
+                listener.bind(new InetSocketAddress("127.0.0.1", 0), 1);
+                listener.setSoTimeout(Math.min(250, VIDEO_PIPE_ACCEPT_TIMEOUT_MS));
+                return new SharedAudioOutput(listener);
+            } catch (IOException | RuntimeException exception) {
+                closeQuietly(listener);
+                throw exception;
+            }
+        }
+
+        private InputStream accept(Process decoder) throws IOException {
+            long deadlineNanos = System.nanoTime()
+                    + TimeUnit.MILLISECONDS.toNanos(VIDEO_PIPE_ACCEPT_TIMEOUT_MS);
+            while (socket == null && System.nanoTime() < deadlineNanos) {
+                try {
+                    socket = listener.accept();
+                } catch (SocketTimeoutException exception) {
+                    if (!decoder.isAlive()) {
+                        throw new IOException("FFmpeg exited before connecting shared audio output",
+                                exception);
+                    }
+                }
+            }
+            if (socket == null) {
+                throw new IOException("Timed out connecting shared audio output");
+            }
+            socket.setTcpNoDelay(true);
+            closeQuietly(listener);
+            return socket.getInputStream();
+        }
+
+        private String url() {
+            return "tcp://127.0.0.1:" + listener.getLocalPort() + "?tcp_nodelay=1";
+        }
+
+        @Override
+        public void close() {
+            closeQuietly(listener);
+            closeQuietly(socket);
+        }
     }
 
     private static final class StripedVideoOutput implements AutoCloseable {
@@ -2602,11 +2703,13 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         private final byte[] firstFrame;
         private final OutputDimensions outputDimensions;
         private final VideoPixelFormat pixelFormat;
+        private final PreparedSharedAudio sharedAudio;
 
         private PreparedVideoDecoder(long preparation, long positionMs, DecodeMode mode,
-                                     Process process, ErrorCollector errors, InputStream output,
-                                     byte[] firstFrame, OutputDimensions outputDimensions,
-                                     VideoPixelFormat pixelFormat) {
+                                      Process process, ErrorCollector errors, InputStream output,
+                                      byte[] firstFrame, OutputDimensions outputDimensions,
+                                      VideoPixelFormat pixelFormat,
+                                      PreparedSharedAudio sharedAudio) {
             this.preparation = preparation;
             this.positionMs = positionMs;
             this.mode = mode;
@@ -2616,7 +2719,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             this.firstFrame = firstFrame;
             this.outputDimensions = outputDimensions;
             this.pixelFormat = pixelFormat;
+            this.sharedAudio = sharedAudio;
         }
+    }
+
+    private record PreparedSharedAudio(InputStream input, byte[] firstChunk,
+                                       int firstChunkBytes) {
     }
 
     private enum FrameReadResult {
@@ -2696,12 +2804,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             return thread;
         });
         private final AtomicLong audioRequestedSeekMs = new AtomicLong(-1L);
-        private final AtomicLong softForwardTargetMs = new AtomicLong(-1L);
 
         private Process audioProcess;
         private Process pendingAudioProcess;
         private PreparedAudioDecoder preparedAudioDecoder;
         private SourceDataLine activeLine;
+        private volatile InputStream sharedInput;
         private long activatedSeekPreparation = -1L;
         private long activeGeneration = -1L;
         private String mediaUrl;
@@ -2718,9 +2826,59 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             audioEstablished = false;
             reconnecting = false;
             lastOutputProgressNanos = 0L;
-            softForwardTargetMs.set(-1L);
             audioRequestedSeekMs.set(startPositionMs);
             startWorkerLocked();
+        }
+
+        private synchronized void openShared(long sessionGeneration, InputStream input,
+                                             Process decoder, long startPositionMs) {
+            closeSharedInputLocked();
+            closeActiveLine();
+            activeGeneration = sessionGeneration;
+            mediaUrl = null;
+            sharedInput = input;
+            audioEstablished = false;
+            reconnecting = false;
+            lastOutputProgressNanos = 0L;
+            audioRequestedSeekMs.set(-1L);
+            executor.execute(() -> playSharedAudio(
+                    sessionGeneration, input, decoder, startPositionMs, null));
+        }
+
+        private Future<PreparedSharedAudio> prepareSharedAudio(
+                long preparation, long sessionGeneration, InputStream input) {
+            return executor.submit(() -> {
+                byte[] pcm = new byte[AUDIO_CHUNK_FRAMES * AUDIO_FRAME_SIZE];
+                int offset = 0;
+                while (offset < pcm.length
+                        && isSeekPreparationCurrent(preparation, sessionGeneration)) {
+                    int read = input.read(pcm, offset, pcm.length - offset);
+                    if (read < 0) {
+                        break;
+                    }
+                    offset += read;
+                }
+                int alignedBytes = offset - offset % AUDIO_FRAME_SIZE;
+                return alignedBytes > 0
+                        && isSeekPreparationCurrent(preparation, sessionGeneration)
+                        ? new PreparedSharedAudio(input, pcm, alignedBytes) : null;
+            });
+        }
+
+        private synchronized void openPreparedShared(long sessionGeneration, Process decoder,
+                                                     long startPositionMs,
+                                                     PreparedSharedAudio prepared) {
+            closeSharedInputLocked();
+            closeActiveLine();
+            activeGeneration = sessionGeneration;
+            mediaUrl = null;
+            sharedInput = prepared.input();
+            audioEstablished = false;
+            reconnecting = false;
+            lastOutputProgressNanos = 0L;
+            audioRequestedSeekMs.set(-1L);
+            executor.execute(() -> playSharedAudio(sessionGeneration, prepared.input(), decoder,
+                    startPositionMs, prepared));
         }
 
         private synchronized void seek(long positionMs) {
@@ -2729,8 +2887,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             Main.LOGGER.debug("Seeking synchronized audio: generation={}, position={} ms",
                     activeGeneration, positionMs);
-            softForwardTargetMs.set(-1L);
             audioRequestedSeekMs.set(positionMs);
+            closeSharedInputLocked();
             destroyAudioProcessLocked();
             startWorkerLocked();
         }
@@ -2836,7 +2994,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             } else {
                 activatedSeekPreparation = preparation;
             }
-            softForwardTargetMs.set(-1L);
             audioRequestedSeekMs.set(positionMs);
             destroyAudioProcessLocked();
             startWorkerLocked();
@@ -2862,8 +3019,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             audioEstablished = false;
             reconnecting = false;
             lastOutputProgressNanos = 0L;
-            softForwardTargetMs.set(-1L);
             audioRequestedSeekMs.set(-1L);
+            closeSharedInputLocked();
             destroyAudioProcessLocked();
             cancelPreparedSeek();
         }
@@ -2871,6 +3028,141 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         private synchronized void dispose() {
             close();
             executor.shutdownNow();
+        }
+
+        private void playSharedAudio(long sessionGeneration, InputStream input,
+                                     Process decoder, long startPositionMs,
+                                     PreparedSharedAudio prepared) {
+            SourceDataLine line = null;
+            AudioReadWatchdog watchdog = new AudioReadWatchdog(decoder, sessionGeneration);
+            boolean submittedAudio = false;
+            long decodedFrames = 0L;
+            long lineBasePositionMs = startPositionMs;
+            try {
+                InputStream output = input;
+                line = openAudioLine();
+                setActiveLine(line, sessionGeneration);
+                byte[] pcm = new byte[AUDIO_CHUNK_FRAMES * AUDIO_FRAME_SIZE];
+                int preparedChunkBytes = 0;
+                if (prepared != null) {
+                    pcm = prepared.firstChunk();
+                    preparedChunkBytes = prepared.firstChunkBytes();
+                }
+                boolean lineRunning = false;
+                float appliedVolume = Float.NaN;
+                long nextVolumeUpdateNanos = 0L;
+                while (isActive(sessionGeneration) && decoder.isAlive()
+                        && sharedInput == input) {
+                    if (clientPaused || !playing || !clockStarted) {
+                        if (lineRunning) {
+                            line.stop();
+                            lineRunning = false;
+                        }
+                        Thread.sleep(10L);
+                        continue;
+                    }
+                    int bytesRead;
+                    if (preparedChunkBytes > 0) {
+                        bytesRead = preparedChunkBytes;
+                        preparedChunkBytes = 0;
+                    } else {
+                        bytesRead = readAudioChunk(output, pcm, sessionGeneration, watchdog,
+                                submittedAudio ? AUDIO_STALL_TIMEOUT_MS : AUDIO_START_TIMEOUT_MS);
+                    }
+                    if (bytesRead <= 0) {
+                        break;
+                    }
+                    bytesRead -= bytesRead % AUDIO_FRAME_SIZE;
+                    if (bytesRead == 0) {
+                        continue;
+                    }
+                    long chunkPositionMs = startPositionMs
+                            + decodedFrames * 1000L / AUDIO_SAMPLE_RATE;
+                    decodedFrames += bytesRead / AUDIO_FRAME_SIZE;
+                    long chunkEndMs = startPositionMs
+                            + decodedFrames * 1000L / AUDIO_SAMPLE_RATE;
+                    if (!submittedAudio && chunkEndMs <= positionMs()) {
+                        continue;
+                    }
+                    while (!submittedAudio && isActive(sessionGeneration)
+                            && sharedInput == input && chunkPositionMs > positionMs()) {
+                        Thread.sleep(2L);
+                    }
+                    if (!isActive(sessionGeneration) || sharedInput != input) {
+                        break;
+                    }
+                    if (!submittedAudio) {
+                        lineBasePositionMs = chunkPositionMs;
+                    }
+                    long now = System.nanoTime();
+                    if (now >= nextVolumeUpdateNanos) {
+                        appliedVolume = updateVolume(line, appliedVolume);
+                        nextVolumeUpdateNanos = now + TimeUnit.MILLISECONDS.toNanos(250L);
+                    }
+                    spatializeAudio(pcm, bytesRead);
+                    writeAudio(line, pcm, bytesRead, watchdog);
+                    if (!submittedAudio) {
+                        submittedAudio = true;
+                        audioEstablished = true;
+                        line.start();
+                        lineRunning = true;
+                        Main.LOGGER.info("Shared FFmpeg produced the first synchronized audio samples");
+                    } else if (!lineRunning || !line.isRunning()) {
+                        line.start();
+                        lineRunning = true;
+                    }
+                    long playedPositionMs = lineBasePositionMs
+                            + line.getLongFramePosition() * 1000L / AUDIO_SAMPLE_RATE;
+                    lastOutputProgressNanos = System.nanoTime();
+                    if (Math.abs(positionMs() - playedPositionMs) > AUDIO_STALL_TIMEOUT_MS) {
+                        resetOutputProgress();
+                    }
+                }
+            } catch (LineUnavailableException exception) {
+                if (isActive(sessionGeneration) && sharedInput == input) {
+                    Main.LOGGER.warn("Audio output is unavailable; draining shared FFmpeg audio: {}",
+                            exception.getMessage());
+                    drainSharedAudio(input, decoder, sessionGeneration);
+                }
+            } catch (IOException exception) {
+                if (isActive(sessionGeneration) && sharedInput == input) {
+                    Main.LOGGER.warn("Unable to play audio from shared FFmpeg process: {}",
+                            exception.getMessage());
+                    requestCoordinatedRecovery(sessionGeneration, "shared audio output");
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            } finally {
+                watchdog.close();
+                closeQuietly(input);
+                clearActiveLine(line);
+                closeAudioLine(line);
+                synchronized (this) {
+                    if (sharedInput == input) {
+                        sharedInput = null;
+                    }
+                }
+                Main.LOGGER.debug("Stopped shared FFmpeg audio output: pid={}, frames={}, submitted={}",
+                        decoder.pid(), decodedFrames, submittedAudio);
+            }
+        }
+
+        private void drainSharedAudio(InputStream input, Process decoder,
+                                      long sessionGeneration) {
+            byte[] discard = new byte[AUDIO_CHUNK_FRAMES * AUDIO_FRAME_SIZE];
+            try {
+                while (isActive(sessionGeneration) && decoder.isAlive()
+                        && sharedInput == input && input.read(discard) >= 0) {
+                    // A shared decoder must keep every output drained or video will block.
+                }
+            } catch (IOException ignored) {
+            }
+        }
+
+        private synchronized void closeSharedInputLocked() {
+            InputStream input = sharedInput;
+            sharedInput = null;
+            closeQuietly(input);
         }
 
         private void startWorkerLocked() {
@@ -3092,9 +3384,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     if (audioRequestedSeekMs.get() >= 0L) {
                         return AudioDecodeResult.SEEK_REQUESTED;
                     }
-                    boolean softForwardPending = softForwardTargetMs.get() >= 0L;
-                    if (clientPaused || !playing
-                            || (!clockStarted && !softForwardPending)) {
+                    if (clientPaused || !playing || !clockStarted) {
                         if (lineRunning) {
                             line.stop();
                             lineRunning = false;
@@ -3583,20 +3873,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             preparedAudioDecoder = null;
             activatedSeekPreparation = -1L;
             return prepared;
-        }
-
-        private void skipForward(long positionMs) {
-            softForwardTargetMs.set(positionMs);
-            Main.LOGGER.debug("Deferring synchronized audio switch until video catches up: "
-                            + "target={} ms", positionMs);
-        }
-
-        private synchronized void completeSoftForward(long positionMs) {
-            if (softForwardTargetMs.compareAndSet(positionMs, -1L)) {
-                Main.LOGGER.debug("Video caught up; switching synchronized audio at {} ms",
-                        positionMs);
-                seek(positionMs);
-            }
         }
 
         private void closePreparedAudioDecoder(PreparedAudioDecoder prepared) {

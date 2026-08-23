@@ -102,10 +102,16 @@ Servers can override the default player permissions through Forge permission nod
   cannot play video and are excluded from preload thresholds and clock consensus.
 - Clients first use a bounded metadata probe to avoid excessive startup buffering for long
   media, then automatically retry with full analysis when the quick result is incomplete.
+- Media with audio and video in one URL uses one FFmpeg decoding process with separate raw
+  audio and video outputs. Configured split video/audio URLs use separate processes.
 - If audio or video stalls, both streams recover together. On-demand media restarts from
   its synchronized position; live media reconnects at the current live edge.
-- During small forward synchronization corrections, current audio continues until video
-  reaches the target, then audio restarts from the synchronized position.
+- Synchronization corrections switch audio and video together at the corrected position.
+  A replacement decoder prepares its first video frame and audio samples in the background
+  while current playback continues, then both streams switch together.
+- Routine drift correction waits for a full five-second sample window and seeks only when
+  the average offset remains at least 750 ms, avoiding startup corrections and seeks caused
+  by isolated latency spikes.
 - If FFmpeg receives HTTP 403, it retries from the session's original URL up to five times
   before reporting the HTTP error.
 - `/video sync` is a client-only command that stops local video and audio, requests the

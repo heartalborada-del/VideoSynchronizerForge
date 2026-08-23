@@ -22,6 +22,8 @@ import org.arkcraft.video_synchronizer.network.VideoStopMessage;
 import org.arkcraft.video_synchronizer.network.VideoTimeSyncRequestMessage;
 import org.arkcraft.video_synchronizer.network.VideoTimeSyncResponseMessage;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,7 +33,8 @@ import java.util.concurrent.TimeUnit;
 public final class ClientVideoState {
     public static final long HARD_SEEK_THRESHOLD_MS = 750L;
     private static final int REPORT_INTERVAL_TICKS = 20;
-    private static final int ROUTINE_CORRECTION_CONFIRMATIONS = 2;
+    private static final int ROUTINE_CORRECTION_MINIMUM_SAMPLES = 3;
+    private static final long ROUTINE_CORRECTION_WINDOW_NANOS = TimeUnit.SECONDS.toNanos(5L);
     private static final long REPORT_DEBOUNCE_NANOS = TimeUnit.SECONDS.toNanos(1L);
     private static final long TIME_SYNC_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10L);
     private static final long TIME_SYNC_SAMPLE_WINDOW_NANOS = TimeUnit.SECONDS.toNanos(60L);
@@ -155,11 +158,11 @@ public final class ClientVideoState {
                 message.sentAtNanos(), message.receivedAtNanos()));
         long clientPosition = session.adapter == null
                 ? session.positionMs : clampToDuration(session, session.adapter.positionMs());
-        boolean driftRequiresSeek = !session.live && session.adapter != null
+        boolean driftSampleValid = !session.live && session.adapter != null
                 && session.adapter.isPlaybackClockStarted()
-                && Math.abs(serverPosition - clientPosition) >= HARD_SEEK_THRESHOLD_MS;
+                && !message.waitingForClients();
         boolean hardSeek = !session.live && (message.hardSeek() || session.confirmRoutineCorrection(
-                serverPosition, clientPosition, driftRequiresSeek));
+                serverPosition, clientPosition, driftSampleValid));
         if (message.hardSeek()) {
             session.clearPendingCorrection();
         }
@@ -666,8 +669,8 @@ public final class ClientVideoState {
         private long lastReportNanos;
         private boolean initialized;
         private boolean awaitingForcedResync;
-        private int pendingCorrectionDirection;
-        private int pendingCorrectionCount;
+        private final Deque<DriftSample> routineCorrectionSamples = new ArrayDeque<>();
+        private long routineCorrectionWindowStartedNanos;
         private long progressSwitchUntilNanos;
         private PlaybackAdapter adapter;
 
@@ -676,28 +679,45 @@ public final class ClientVideoState {
         }
 
         private void clearPendingCorrection() {
-            pendingCorrectionDirection = 0;
-            pendingCorrectionCount = 0;
+            routineCorrectionSamples.clear();
+            routineCorrectionWindowStartedNanos = 0L;
         }
 
         private boolean confirmRoutineCorrection(long serverPosition, long clientPosition,
-                                                  boolean driftRequiresSeek) {
-            if (!driftRequiresSeek) {
+                                                  boolean sampleValid) {
+            if (!sampleValid) {
                 clearPendingCorrection();
                 return false;
             }
-            int direction = Long.signum(serverPosition - clientPosition);
-            if (pendingCorrectionCount == 0 || direction != pendingCorrectionDirection) {
-                pendingCorrectionDirection = direction;
-                pendingCorrectionCount = 1;
+            long nowNanos = System.nanoTime();
+            if (routineCorrectionWindowStartedNanos == 0L) {
+                routineCorrectionWindowStartedNanos = nowNanos;
+            }
+            routineCorrectionSamples.addLast(
+                    new DriftSample(nowNanos, serverPosition - clientPosition));
+            while (!routineCorrectionSamples.isEmpty()
+                    && nowNanos - routineCorrectionSamples.peekFirst().receivedNanos()
+                    > ROUTINE_CORRECTION_WINDOW_NANOS) {
+                routineCorrectionSamples.removeFirst();
+            }
+            if (routineCorrectionSamples.size() < ROUTINE_CORRECTION_MINIMUM_SAMPLES
+                    || nowNanos - routineCorrectionWindowStartedNanos
+                    < ROUTINE_CORRECTION_WINDOW_NANOS) {
                 return false;
             }
-            pendingCorrectionCount++;
-            if (pendingCorrectionCount < ROUTINE_CORRECTION_CONFIRMATIONS) {
+            long totalDriftMs = 0L;
+            for (DriftSample sample : routineCorrectionSamples) {
+                totalDriftMs += sample.driftMs();
+            }
+            long averageDriftMs = totalDriftMs / routineCorrectionSamples.size();
+            if (Math.abs(averageDriftMs) < HARD_SEEK_THRESHOLD_MS) {
                 return false;
             }
             clearPendingCorrection();
             return true;
+        }
+
+        private record DriftSample(long receivedNanos, long driftMs) {
         }
 
         private void showProgressSwitch(long from, long to) {
