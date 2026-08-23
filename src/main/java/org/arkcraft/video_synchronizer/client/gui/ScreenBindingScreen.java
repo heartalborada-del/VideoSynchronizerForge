@@ -7,7 +7,7 @@ import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
-import org.arkcraft.video_synchronizer.network.UpdateScreenBindingMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.UpdateScreenBindingMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 
 public final class ScreenBindingScreen extends Screen {

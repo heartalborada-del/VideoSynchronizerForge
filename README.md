@@ -108,7 +108,17 @@ Servers can override the default player permissions through Forge permission nod
   its synchronized position; live media reconnects at the current live edge.
 - Synchronization corrections switch audio and video together at the corrected position.
   A replacement decoder prepares its first video frame and audio samples in the background
-  while current playback continues, then both streams switch together.
+  while current playback continues, then discards frames behind the projected switch time
+  before both streams switch together.
+- Forward corrections up to 30 seconds keep the active FFmpeg processes and rapidly discard
+  old video frames and audio samples. A fixed target slightly ahead of the received server time
+  prevents a moving target from trapping a slow client in catch-up. Once caught up, the local
+  clock accounts for the actual catch-up time instead of the decode lead, keeping progress
+  reports aligned with the server. Sub-second corrections only rebase the local clock; larger
+  or backward corrections use an FFmpeg seek.
+- Falling behind the playback clock does not by itself restart FFmpeg. Bounded frame queues keep
+  the newest useful video frame, while a decoder restart is reserved for confirmed output stalls
+  or failures.
 - Routine drift correction waits for a full five-second sample window and seeks only when
   the average offset remains at least 750 ms, avoiding startup corrections and seeks caused
   by isolated latency spikes.

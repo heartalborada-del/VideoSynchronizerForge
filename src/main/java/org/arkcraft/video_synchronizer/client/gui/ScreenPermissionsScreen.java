@@ -6,9 +6,9 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
-import org.arkcraft.video_synchronizer.network.OpenScreenPermissionsMessage;
-import org.arkcraft.video_synchronizer.network.ScreenAccessRole;
-import org.arkcraft.video_synchronizer.network.ScreenPermissionActionMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenScreenPermissionsMessage;
+import org.arkcraft.video_synchronizer.network.model.ScreenAccessRole;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.ScreenPermissionActionMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.server.ScreenAccessMode;
 

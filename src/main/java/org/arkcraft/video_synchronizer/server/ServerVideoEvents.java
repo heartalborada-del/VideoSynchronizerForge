@@ -26,9 +26,9 @@ import org.arkcraft.video_synchronizer.block.ScreenLayout;
 import org.arkcraft.video_synchronizer.block.ScreenBlock;
 import org.arkcraft.video_synchronizer.block.VideoManagerBlock;
 import org.arkcraft.video_synchronizer.block.VideoManagerBlockEntity;
-import org.arkcraft.video_synchronizer.network.AudioPlaybackMode;
-import org.arkcraft.video_synchronizer.network.ScreenAccessRole;
-import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.model.AudioPlaybackMode;
+import org.arkcraft.video_synchronizer.network.model.ScreenAccessRole;
+import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
 
 import java.util.Locale;
 import java.util.UUID;

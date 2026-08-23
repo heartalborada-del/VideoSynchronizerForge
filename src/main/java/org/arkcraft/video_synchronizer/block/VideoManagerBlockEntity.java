@@ -5,8 +5,8 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import org.arkcraft.video_synchronizer.Main;
-import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
-import org.arkcraft.video_synchronizer.network.AudioPlaybackMode;
+import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.model.AudioPlaybackMode;
 
 import java.util.UUID;
 

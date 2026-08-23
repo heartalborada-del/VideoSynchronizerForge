@@ -10,7 +10,7 @@ import org.arkcraft.video_synchronizer.block.ScreenBlock;
 import org.arkcraft.video_synchronizer.block.ScreenLayout;
 import org.arkcraft.video_synchronizer.block.ScreenOrientation;
 import org.arkcraft.video_synchronizer.client.render.ScreenTexture;
-import org.arkcraft.video_synchronizer.network.VideoScreenTargetMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoScreenTargetMessage;
 
 import java.util.Map;
 import java.util.Set;

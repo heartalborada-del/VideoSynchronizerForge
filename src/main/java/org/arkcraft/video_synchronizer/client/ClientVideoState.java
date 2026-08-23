@@ -6,21 +6,21 @@ import net.minecraft.network.chat.Component;
 import org.arkcraft.video_synchronizer.Main;
 import org.arkcraft.video_synchronizer.client.gui.VideoManagerScreen;
 import org.arkcraft.video_synchronizer.client.player.FfmpegPlaybackAdapter;
-import org.arkcraft.video_synchronizer.network.VideoClientCapabilityMessage;
-import org.arkcraft.video_synchronizer.network.AudioPlaybackMode;
-import org.arkcraft.video_synchronizer.network.VideoLocalPauseMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoClientCapabilityMessage;
+import org.arkcraft.video_synchronizer.network.model.AudioPlaybackMode;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoLocalPauseMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
-import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
-import org.arkcraft.video_synchronizer.network.VideoPlaybackErrorMessage;
-import org.arkcraft.video_synchronizer.network.VideoPlaybackNoticeMessage;
-import org.arkcraft.video_synchronizer.network.VideoProgressMessage;
-import org.arkcraft.video_synchronizer.network.VideoReadyMessage;
-import org.arkcraft.video_synchronizer.network.VideoResyncMessage;
-import org.arkcraft.video_synchronizer.network.VideoStartMessage;
-import org.arkcraft.video_synchronizer.network.VideoStateMessage;
-import org.arkcraft.video_synchronizer.network.VideoStopMessage;
-import org.arkcraft.video_synchronizer.network.VideoTimeSyncRequestMessage;
-import org.arkcraft.video_synchronizer.network.VideoTimeSyncResponseMessage;
+import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoPlaybackErrorMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoPlaybackNoticeMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoProgressMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoReadyMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoResyncMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoStartMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoStateMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoStopMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoTimeSyncRequestMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoTimeSyncResponseMessage;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -364,10 +364,11 @@ public final class ClientVideoState {
         });
     }
 
-    public static void onFrameRendered(String sessionId, long positionMs) {
+    public static void onFrameRendered(String sessionId, long positionMs,
+                                       long playbackGeneration) {
         SessionState session = SESSIONS.get(sessionId);
         if (session != null && session.adapter != null) {
-            session.adapter.onFrameRendered(positionMs);
+            session.adapter.onFrameRendered(positionMs, playbackGeneration);
         }
     }
 
@@ -750,7 +751,7 @@ public final class ClientVideoState {
         default void setClientPaused(boolean paused) {
         }
 
-        default void onFrameRendered(long positionMs) {
+        default void onFrameRendered(long positionMs, long playbackGeneration) {
         }
 
         default boolean isPlaybackClockStarted() {

@@ -10,7 +10,7 @@ import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.saveddata.SavedData;
-import org.arkcraft.video_synchronizer.network.ScreenAccessRole;
+import org.arkcraft.video_synchronizer.network.model.ScreenAccessRole;
 
 import java.util.ArrayList;
 import java.util.Collection;

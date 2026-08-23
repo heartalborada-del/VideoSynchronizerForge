@@ -5,7 +5,7 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
-import org.arkcraft.video_synchronizer.network.OpenVideoManagerMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenVideoManagerMessage;
 
 import java.util.List;
 

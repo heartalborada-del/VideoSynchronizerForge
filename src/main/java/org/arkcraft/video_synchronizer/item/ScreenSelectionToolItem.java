@@ -15,7 +15,7 @@ import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.world.level.Level;
 import net.minecraftforge.network.PacketDistributor;
 import org.arkcraft.video_synchronizer.LocalizedArgumentException;
-import org.arkcraft.video_synchronizer.network.OpenScreenBindingMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenScreenBindingMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.server.ScreenCreator;
 import org.arkcraft.video_synchronizer.server.ServerScreenRegistry;

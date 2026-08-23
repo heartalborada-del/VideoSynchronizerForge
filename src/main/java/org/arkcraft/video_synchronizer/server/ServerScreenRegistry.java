@@ -16,7 +16,7 @@ import org.arkcraft.video_synchronizer.block.ScreenBlock;
 import org.arkcraft.video_synchronizer.block.ScreenBlockEntity;
 import org.arkcraft.video_synchronizer.block.ScreenLayout;
 import org.arkcraft.video_synchronizer.block.ScreenOrientation;
-import org.arkcraft.video_synchronizer.network.ScreenAccessRole;
+import org.arkcraft.video_synchronizer.network.model.ScreenAccessRole;
 
 import java.util.ArrayList;
 import java.util.Comparator;

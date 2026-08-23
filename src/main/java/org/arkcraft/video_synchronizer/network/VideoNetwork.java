@@ -5,6 +5,27 @@ import net.minecraftforge.network.NetworkRegistry;
 import net.minecraftforge.network.NetworkDirection;
 import net.minecraftforge.network.simple.SimpleChannel;
 import org.arkcraft.video_synchronizer.Main;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenPlaybackConsentMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenScreenBindingMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenScreenPermissionsMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenVideoManagerMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoPlaybackNoticeMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoScreenTargetMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoStartMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoStateMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoStopMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoTimeSyncResponseMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.ScreenPermissionActionMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.UpdatePlaybackConsentMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.UpdateScreenBindingMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoClientCapabilityMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoLocalPauseMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoManagerActionMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoPlaybackErrorMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoProgressMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoReadyMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoResyncMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoTimeSyncRequestMessage;
 
 /** The single protocol used by both sides of a video session. */
 public final class VideoNetwork {

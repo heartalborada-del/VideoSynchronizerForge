@@ -5,8 +5,8 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
-import org.arkcraft.video_synchronizer.network.OpenPlaybackConsentMessage;
-import org.arkcraft.video_synchronizer.network.UpdatePlaybackConsentMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenPlaybackConsentMessage;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.UpdatePlaybackConsentMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 
 public final class PlaybackConsentScreen extends Screen {

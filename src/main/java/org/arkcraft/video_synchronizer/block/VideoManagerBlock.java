@@ -21,8 +21,8 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.StateDefinition;
 import net.minecraft.world.level.block.state.properties.DirectionProperty;
 import net.minecraft.world.phys.BlockHitResult;
-import org.arkcraft.video_synchronizer.network.OpenVideoManagerMessage;
-import org.arkcraft.video_synchronizer.network.OpenPlaybackConsentMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenVideoManagerMessage;
+import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenPlaybackConsentMessage;
 import org.arkcraft.video_synchronizer.server.ServerScreenRegistry;
 import org.jetbrains.annotations.Nullable;
 

@@ -5,9 +5,9 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.resources.ResourceLocation;
 import org.arkcraft.video_synchronizer.client.ClientVideoState;
-import org.arkcraft.video_synchronizer.client.player.VideoFrameBuffer;
+import org.arkcraft.video_synchronizer.client.player.video.VideoFrameBuffer;
 import org.arkcraft.video_synchronizer.Main;
-import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL21;
@@ -162,12 +162,14 @@ public final class ScreenTexture {
 
             if (createdTexture) {
                 uploadDirect(frame.data(), frame.pixelFormat());
-                ClientVideoState.onFrameRendered(sessionId, frame.positionMs());
+                ClientVideoState.onFrameRendered(sessionId, frame.positionMs(),
+                        frame.playbackGeneration());
                 return;
             }
             if (pixelBufferUpload && uploadWithPixelBuffer(
                     frame.data(), frame.pixelFormat())) {
-                ClientVideoState.onFrameRendered(sessionId, frame.positionMs());
+                ClientVideoState.onFrameRendered(sessionId, frame.positionMs(),
+                        frame.playbackGeneration());
                 return;
             }
             if (pixelBufferUpload) {
@@ -175,7 +177,8 @@ public final class ScreenTexture {
                 Main.LOGGER.warn("Mapped video texture upload is unavailable; using direct upload");
             }
             uploadDirect(frame.data(), frame.pixelFormat());
-            ClientVideoState.onFrameRendered(sessionId, frame.positionMs());
+            ClientVideoState.onFrameRendered(sessionId, frame.positionMs(),
+                    frame.playbackGeneration());
         } finally {
             frameBuffer.release(frame);
         }

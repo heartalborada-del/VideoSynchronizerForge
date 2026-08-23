@@ -8,15 +8,18 @@ import net.minecraft.world.phys.Vec3;
 import org.arkcraft.video_synchronizer.Main;
 import org.arkcraft.video_synchronizer.client.ClientScreenTarget;
 import org.arkcraft.video_synchronizer.client.ClientVideoState;
+import org.arkcraft.video_synchronizer.client.player.audio.SpatialAudioState;
+import org.arkcraft.video_synchronizer.client.player.ffmpeg.EmbeddedFfmpeg;
+import org.arkcraft.video_synchronizer.client.player.ffmpeg.FfmpegErrorCollector;
+import org.arkcraft.video_synchronizer.client.player.video.VideoFrameBuffer;
 import org.arkcraft.video_synchronizer.client.render.ScreenTexture;
-import org.arkcraft.video_synchronizer.network.MediaRequestOptions;
-import org.arkcraft.video_synchronizer.network.AudioPlaybackMode;
-import org.arkcraft.video_synchronizer.network.VideoPixelFormat;
-import org.arkcraft.video_synchronizer.network.VideoPlaybackErrorMessage;
+import org.arkcraft.video_synchronizer.network.model.MediaRequestOptions;
+import org.arkcraft.video_synchronizer.network.model.AudioPlaybackMode;
+import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoPlaybackErrorMessage;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -79,7 +82,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             "video_synchronizer.inputThreadQueuePackets", 512);
     private static final String NETWORK_TIMEOUT_US = "15000000";
     private static final String HTTP_SHORT_SEEK_SIZE = "1048576";
-    private static final int MAX_FFMPEG_ERROR_LENGTH = 8_192;
     private static final int AUDIO_SAMPLE_RATE = 48_000;
     private static final int AUDIO_CHANNELS = 2;
     private static final double DEFAULT_AUDIO_MAX_DISTANCE = positiveDoubleProperty(
@@ -104,9 +106,10 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static final long VIDEO_START_TIMEOUT_MS = 60_000L;
     private static final long VIDEO_STALL_TIMEOUT_MS = 5_000L;
     private static final long VIDEO_RECOVERY_STABLE_NANOS = TimeUnit.SECONDS.toNanos(5L);
-    private static final long VIDEO_CATCH_UP_THRESHOLD_MS = 2_000L;
-    private static final long VIDEO_CATCH_UP_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(5L);
-    private static final long SEEK_PREPARE_TIMEOUT_MS = 5_000L;
+    private static final long FORWARD_DROP_MIN_DISTANCE_MS = 750L;
+    private static final long FORWARD_DROP_MAX_DISTANCE_MS = 30_000L;
+    private static final long FORWARD_DROP_LEAD_MS = 2_000L;
+    private static final long SEEK_PREPARE_TIMEOUT_MS = 10_000L;
     private static final long SEEK_REPLACE_THRESHOLD_MS = 2_000L;
     private static final Pattern HTTP_STATUS_PATTERN = Pattern.compile(
             "(?i)(?:\\bHTTP\\s+(?:error\\s+)?|\\bserver\\s+returned\\s+)"
@@ -133,6 +136,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private final AtomicLong generation = new AtomicLong();
     private final AtomicLong requestedSeekMs = new AtomicLong(-1L);
     private final AtomicLong seekPreparationGeneration = new AtomicLong();
+    private final AtomicLong playbackGeneration = new AtomicLong();
     private final AtomicLong reportedPlaybackErrorGeneration = new AtomicLong(-1L);
     private final String sessionId;
     private final VideoFrameBuffer frameBuffer = new VideoFrameBuffer();
@@ -178,8 +182,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private volatile long preloadDecodedFrames;
     private volatile boolean preloadDiagnosticsLogged;
     private volatile boolean videoReconnecting;
+    private volatile long dropFramesUntilPositionMs = -1L;
+    private volatile long dropClockPositionMs = -1L;
+    private volatile long dropStartedNanos;
+    private volatile boolean dropClockPlaying;
     private volatile long lastVideoFrameNanos;
-    private volatile long lastCatchUpSeekNanos;
     private volatile SpatialAudioState spatialAudioState = SpatialAudioState.FULL_VOLUME;
 
     public FfmpegPlaybackAdapter(String sessionId) {
@@ -245,7 +252,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         this.preloadDiagnosticsLogged = false;
         this.videoReconnecting = false;
         this.lastVideoFrameNanos = 0L;
-        this.lastCatchUpSeekNanos = 0L;
         this.spatialAudioState = SpatialAudioState.SILENT;
         this.activeMetadata = null;
         this.activeMediaUrl = videoUrl;
@@ -300,6 +306,38 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             Main.LOGGER.debug("Resuming live playback at the current stream edge");
             return;
         }
+        long forwardDistanceMs = boundedPosition - currentPosition;
+        if (hardSeek && Math.abs(forwardDistanceMs) < FORWARD_DROP_MIN_DISTANCE_MS
+                && decoderProcess) {
+            this.anchorPositionMs = boundedPosition;
+            this.anchorNanos = System.nanoTime();
+            this.playing = playing;
+            Main.LOGGER.debug("Applied small synchronized clock correction of {} ms without "
+                    + "seeking or entering frame catch-up", forwardDistanceMs);
+            return;
+        }
+        if (hardSeek && forwardDistanceMs > 0L
+                && forwardDistanceMs >= FORWARD_DROP_MIN_DISTANCE_MS
+                && forwardDistanceMs <= FORWARD_DROP_MAX_DISTANCE_MS
+                && decoderProcess) {
+            this.anchorPositionMs = boundedPosition;
+            this.anchorNanos = System.nanoTime();
+            this.playing = playing;
+            clockStarted = false;
+            long dropTargetMs = clampToDuration(boundedPosition
+                    + (playing ? FORWARD_DROP_LEAD_MS : 0L));
+            dropFramesUntilPositionMs = dropTargetMs;
+            dropClockPositionMs = boundedPosition;
+            dropStartedNanos = System.nanoTime();
+            dropClockPlaying = playing;
+            playbackGeneration.incrementAndGet();
+            frameBuffer.clear();
+            audioPlayback.catchUpTo(dropTargetMs);
+            Main.LOGGER.debug("Catching up synchronized playback by dropping {} ms of decoded "
+                            + "audio and video without restarting FFmpeg (fixed target={} ms)",
+                    forwardDistanceMs, dropTargetMs);
+            return;
+        }
         if (hardSeek && canPrepareSeek()) {
             if (playbackStateChanged) {
                 this.anchorPositionMs = currentPosition;
@@ -320,6 +358,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             Main.LOGGER.debug("Scheduling hard video seek to {} ms and terminating active decoder",
                     boundedPosition);
             clockStarted = false;
+            playbackGeneration.incrementAndGet();
+            clearFrameDropTarget();
             frameBuffer.clear();
             requestedSeekMs.set(boundedPosition);
             destroyDecoderProcess();
@@ -380,7 +420,20 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     }
 
     @Override
-    public synchronized void onFrameRendered(long positionMs) {
+    public synchronized void onFrameRendered(long positionMs, long renderedGeneration) {
+        long currentGeneration = playbackGeneration.get();
+        if (renderedGeneration != currentGeneration) {
+            Main.LOGGER.debug("Ignoring stale rendered video frame at {} ms: frameGeneration={}, "
+                            + "playbackGeneration={}",
+                    positionMs, renderedGeneration, currentGeneration);
+            return;
+        }
+        long dropTargetMs = frameDropTargetMs();
+        if (dropTargetMs >= 0L && positionMs + 75L < dropTargetMs) {
+            return;
+        }
+        long synchronizedClockPositionMs = projectedDropClockPositionMs();
+        clearFrameDropTarget();
         long nowNanos = System.nanoTime();
         if (preloading) {
             if (preloadStartedNanos == 0L) {
@@ -395,7 +448,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         if (clockStarted) {
             return;
         }
-        anchorPositionMs = clampToDuration(positionMs);
+        anchorPositionMs = synchronizedClockPositionMs >= 0L
+                ? synchronizedClockPositionMs : clampToDuration(positionMs);
         anchorNanos = nowNanos;
         clockStarted = true;
         Main.LOGGER.debug("Client playback clock started at first rendered frame {} ms",
@@ -410,6 +464,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     @Override
     public synchronized boolean isPlaybackReady() {
         if (!playbackReady && preloading && preloadFrameDecoded && clockStarted) {
+            if (audioPlayback.isCatchingUp()) {
+                return false;
+            }
             logPreloadDiagnostics();
             playbackReady = true;
             Main.LOGGER.debug("Client input preload completed with the verified frame cache");
@@ -440,7 +497,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
 
     @Override
     public synchronized boolean isPreparingSeek() {
-        return pendingSeekPreparation >= 0L || activatedSeekPreparation >= 0L;
+        return pendingSeekPreparation >= 0L || activatedSeekPreparation >= 0L
+                || dropFramesUntilPositionMs >= 0L || audioPlayback.isCatchingUp();
     }
 
     @Override
@@ -506,6 +564,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         playing = false;
         clientPaused = false;
         clockStarted = false;
+        playbackGeneration.incrementAndGet();
+        clearFrameDropTarget();
         preloading = false;
         preloadFrameDecoded = false;
         playbackReady = false;
@@ -516,7 +576,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         preloadDiagnosticsLogged = false;
         videoReconnecting = false;
         lastVideoFrameNanos = 0L;
-        lastCatchUpSeekNanos = 0L;
         spatialAudioState = SpatialAudioState.SILENT;
         requestedSeekMs.set(-1L);
         cancelPreparedSeek();
@@ -863,7 +922,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             addSharedAudioOutput(command, sharedAudioOutput);
         }
         Process decoder;
-        ErrorCollector errors;
+        FfmpegErrorCollector errors;
         InputStream decoderOutput;
         byte[] preparedFrame = null;
         long decoderStartPosition = startPosition;
@@ -896,7 +955,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 terminateProcessTree(decoder);
                 return DecodeResult.ENDED;
             }
-            errors = new ErrorCollector(decoder.getErrorStream());
+            errors = new FfmpegErrorCollector(decoder.getErrorStream());
             errors.start();
             decoderOutput = decoder.getInputStream();
             if (stripedOutput != null) {
@@ -1031,8 +1090,14 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
 
                 long playbackPosition = positionMs();
                 long requiredFramePosition = -1L;
-                if (playing && preparedDecoder != null && !clockStarted) {
+                // Server-coordinated seeks pause while clients preload. The replacement
+                // decoder must still discard frames decoded behind the projected target.
+                if (preparedDecoder != null && !clockStarted) {
                     requiredFramePosition = playbackPosition;
+                }
+                long dropTargetMs = frameDropTargetMs();
+                if (dropTargetMs >= 0L) {
+                    requiredFramePosition = Math.max(requiredFramePosition, dropTargetMs);
                 }
                 if (requiredFramePosition >= 0L
                         && framePosition + 75L < requiredFramePosition) {
@@ -1053,28 +1118,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             + Math.round(decodedFrames * frameDurationMs);
                     continue;
                 }
-                long catchUpNow = System.nanoTime();
-                long videoBehindMs = playbackPosition - framePosition;
-                if (!liveStream && clockStarted && playing && !clientPaused && !preloading
-                        && videoBehindMs >= VIDEO_CATCH_UP_THRESHOLD_MS
-                        && catchUpNow - lastCatchUpSeekNanos
-                        >= VIDEO_CATCH_UP_COOLDOWN_NANOS
-                        && requestCoordinatedRecovery(sessionGeneration,
-                                "video decoder fell " + videoBehindMs
-                                + " ms behind the synchronized clock")) {
-                    lastCatchUpSeekNanos = catchUpNow;
-                    frameBuffer.release(
-                            new VideoFrameBuffer.DecodedFrame(
-                                    outputDimensions.width, outputDimensions.height,
-                                    framePosition, pixelFormat, frameData));
-                    return DecodeResult.SEEK_REQUESTED;
-                }
-
                 long pacingStartNanos = System.nanoTime();
-                boolean startingPreparedClock = !clockStarted
-                        && preparedDecoder != null;
+                boolean startingSynchronizedClock = !clockStarted
+                        && (preparedDecoder != null || dropTargetMs >= 0L);
                 while (generation.get() == sessionGeneration && requestedSeekMs.get() < 0L
-                        && !startingPreparedClock
+                        && !startingSynchronizedClock
                         && framePosition > positionMs() + 75L) {
                     Thread.sleep(5L);
                 }
@@ -1111,7 +1159,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 }
                 VideoFrameBuffer.DecodedFrame frame = new VideoFrameBuffer.DecodedFrame(
                         outputDimensions.width, outputDimensions.height, framePosition,
-                        pixelFormat, frameData);
+                        pixelFormat, frameData, playbackGeneration.get());
                 frameBuffer.submit(frame);
                 submittedFrame = true;
                 if (preloading) {
@@ -1306,7 +1354,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             terminateProcessTree(candidate);
             return null;
         }
-        ErrorCollector errors = new ErrorCollector(candidate.getErrorStream());
+        FfmpegErrorCollector errors = new FfmpegErrorCollector(candidate.getErrorStream());
         errors.start();
         InputStream output = candidate.getInputStream();
         InputStream sharedAudioInput = null;
@@ -1453,6 +1501,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         anchorPositionMs = positionMs;
         anchorNanos = nowNanos;
         clockStarted = false;
+        playbackGeneration.incrementAndGet();
+        clearFrameDropTarget();
         frameBuffer.clear();
         activatedSeekPreparation = preparation;
         audioPlayback.activatePreparedSeek(preparation, positionMs,
@@ -1496,10 +1546,35 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         return clampToDuration(positionMs);
     }
 
+    private long frameDropTargetMs() {
+        return dropFramesUntilPositionMs;
+    }
+
+    private long projectedDropClockPositionMs() {
+        long positionMs = dropClockPositionMs;
+        if (positionMs < 0L) {
+            return -1L;
+        }
+        if (dropClockPlaying && dropStartedNanos > 0L) {
+            positionMs += TimeUnit.NANOSECONDS.toMillis(
+                    Math.max(0L, System.nanoTime() - dropStartedNanos));
+        }
+        return clampToDuration(positionMs);
+    }
+
+    private void clearFrameDropTarget() {
+        dropFramesUntilPositionMs = -1L;
+        dropClockPositionMs = -1L;
+        dropStartedNanos = 0L;
+        dropClockPlaying = false;
+    }
+
     private void requestImmediateSeek(long positionMs) {
         anchorPositionMs = positionMs;
         anchorNanos = System.nanoTime();
         clockStarted = false;
+        playbackGeneration.incrementAndGet();
+        clearFrameDropTarget();
         frameBuffer.clear();
         requestedSeekMs.set(positionMs);
         destroyDecoderProcess();
@@ -2698,7 +2773,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         private final long positionMs;
         private final DecodeMode mode;
         private final Process process;
-        private final ErrorCollector errors;
+        private final FfmpegErrorCollector errors;
         private final InputStream output;
         private final byte[] firstFrame;
         private final OutputDimensions outputDimensions;
@@ -2706,7 +2781,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         private final PreparedSharedAudio sharedAudio;
 
         private PreparedVideoDecoder(long preparation, long positionMs, DecodeMode mode,
-                                      Process process, ErrorCollector errors, InputStream output,
+                                      Process process, FfmpegErrorCollector errors,
+                                      InputStream output,
                                       byte[] firstFrame, OutputDimensions outputDimensions,
                                       VideoPixelFormat pixelFormat,
                                       PreparedSharedAudio sharedAudio) {
@@ -2780,11 +2856,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         ENDED_AFTER_STABLE_AUDIO
     }
 
-    private record SpatialAudioState(double leftGain, double rightGain) {
-        private static final SpatialAudioState FULL_VOLUME = new SpatialAudioState(1.0D, 1.0D);
-        private static final SpatialAudioState SILENT = new SpatialAudioState(0.0D, 0.0D);
-    }
-
     private enum DecodeMode {
         CUDA_SCALE("CUDA GPU-scaled"),
         AUTO_HARDWARE("hardware-assisted"),
@@ -2804,6 +2875,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             return thread;
         });
         private final AtomicLong audioRequestedSeekMs = new AtomicLong(-1L);
+        private final AtomicLong audioDropUntilPositionMs = new AtomicLong(-1L);
 
         private Process audioProcess;
         private Process pendingAudioProcess;
@@ -2827,6 +2899,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             reconnecting = false;
             lastOutputProgressNanos = 0L;
             audioRequestedSeekMs.set(startPositionMs);
+            audioDropUntilPositionMs.set(-1L);
             startWorkerLocked();
         }
 
@@ -2841,6 +2914,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             reconnecting = false;
             lastOutputProgressNanos = 0L;
             audioRequestedSeekMs.set(-1L);
+            audioDropUntilPositionMs.set(-1L);
             executor.execute(() -> playSharedAudio(
                     sessionGeneration, input, decoder, startPositionMs, null));
         }
@@ -2877,6 +2951,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             reconnecting = false;
             lastOutputProgressNanos = 0L;
             audioRequestedSeekMs.set(-1L);
+            audioDropUntilPositionMs.set(-1L);
             executor.execute(() -> playSharedAudio(sessionGeneration, prepared.input(), decoder,
                     startPositionMs, prepared));
         }
@@ -2888,9 +2963,25 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             Main.LOGGER.debug("Seeking synchronized audio: generation={}, position={} ms",
                     activeGeneration, positionMs);
             audioRequestedSeekMs.set(positionMs);
+            audioDropUntilPositionMs.set(-1L);
             closeSharedInputLocked();
             destroyAudioProcessLocked();
             startWorkerLocked();
+        }
+
+        private synchronized void catchUpTo(long positionMs) {
+            if (activeGeneration < 0L || (mediaUrl == null && sharedInput == null)) {
+                return;
+            }
+            audioDropUntilPositionMs.accumulateAndGet(positionMs, Math::max);
+            resetOutputProgress();
+            if (mediaUrl != null) {
+                startWorkerLocked();
+            }
+        }
+
+        private boolean isCatchingUp() {
+            return audioDropUntilPositionMs.get() >= 0L;
         }
 
         private synchronized void prepareSeek(long preparation, long sessionGeneration,
@@ -2903,7 +2994,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         private void prepareAudioDecoder(long preparation, long sessionGeneration,
                                          String sessionUrl, long positionMs) {
             Process candidate = null;
-            ErrorCollector errors = null;
+            FfmpegErrorCollector errors = null;
             InputStream output = null;
             try {
                 List<String> command = audioCommand(sessionUrl, positionMs);
@@ -2912,7 +3003,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     terminateProcessTree(candidate);
                     return;
                 }
-                errors = new ErrorCollector(candidate.getErrorStream());
+                errors = new FfmpegErrorCollector(candidate.getErrorStream());
                 errors.start();
                 output = candidate.getInputStream();
                 byte[] pcm = new byte[AUDIO_CHUNK_FRAMES * AUDIO_FRAME_SIZE];
@@ -2995,6 +3086,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 activatedSeekPreparation = preparation;
             }
             audioRequestedSeekMs.set(positionMs);
+            audioDropUntilPositionMs.set(-1L);
             destroyAudioProcessLocked();
             startWorkerLocked();
         }
@@ -3020,6 +3112,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             reconnecting = false;
             lastOutputProgressNanos = 0L;
             audioRequestedSeekMs.set(-1L);
+            audioDropUntilPositionMs.set(-1L);
             closeSharedInputLocked();
             destroyAudioProcessLocked();
             cancelPreparedSeek();
@@ -3038,6 +3131,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             boolean submittedAudio = false;
             long decodedFrames = 0L;
             long lineBasePositionMs = startPositionMs;
+            long lineBaseFrame = 0L;
             try {
                 InputStream output = input;
                 line = openAudioLine();
@@ -3053,13 +3147,21 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 long nextVolumeUpdateNanos = 0L;
                 while (isActive(sessionGeneration) && decoder.isAlive()
                         && sharedInput == input) {
-                    if (clientPaused || !playing || !clockStarted) {
+                    if (clientPaused || ((!playing || !clockStarted)
+                            && !isCatchingUp())) {
                         if (lineRunning) {
                             line.stop();
                             lineRunning = false;
                         }
                         Thread.sleep(10L);
                         continue;
+                    }
+                    if (isCatchingUp() && lineRunning) {
+                        line.stop();
+                        line.flush();
+                        lineRunning = false;
+                        submittedAudio = false;
+                        audioEstablished = false;
                     }
                     int bytesRead;
                     if (preparedChunkBytes > 0) {
@@ -3081,6 +3183,25 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     decodedFrames += bytesRead / AUDIO_FRAME_SIZE;
                     long chunkEndMs = startPositionMs
                             + decodedFrames * 1000L / AUDIO_SAMPLE_RATE;
+                    long catchUpTargetMs = audioDropUntilPositionMs.get();
+                    if (catchUpTargetMs >= 0L) {
+                        if (lineRunning) {
+                            line.stop();
+                            line.flush();
+                            lineRunning = false;
+                        }
+                        submittedAudio = false;
+                        audioEstablished = false;
+                        if (chunkEndMs <= catchUpTargetMs) {
+                            continue;
+                        }
+                        if (!audioDropUntilPositionMs.compareAndSet(catchUpTargetMs, -1L)) {
+                            continue;
+                        }
+                        if (!playing || !clockStarted) {
+                            continue;
+                        }
+                    }
                     if (!submittedAudio && chunkEndMs <= positionMs()) {
                         continue;
                     }
@@ -3093,6 +3214,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     }
                     if (!submittedAudio) {
                         lineBasePositionMs = chunkPositionMs;
+                        lineBaseFrame = line.getLongFramePosition();
                     }
                     long now = System.nanoTime();
                     if (now >= nextVolumeUpdateNanos) {
@@ -3112,7 +3234,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         lineRunning = true;
                     }
                     long playedPositionMs = lineBasePositionMs
-                            + line.getLongFramePosition() * 1000L / AUDIO_SAMPLE_RATE;
+                            + (line.getLongFramePosition() - lineBaseFrame)
+                            * 1000L / AUDIO_SAMPLE_RATE;
                     lastOutputProgressNanos = System.nanoTime();
                     if (Math.abs(positionMs() - playedPositionMs) > AUDIO_STALL_TIMEOUT_MS) {
                         resetOutputProgress();
@@ -3324,7 +3447,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 throw exception;
             }
             Process decoder;
-            ErrorCollector errors;
+            FfmpegErrorCollector errors;
             InputStream decoderOutput;
             byte[] pcm;
             int preparedChunkBytes = 0;
@@ -3354,7 +3477,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     line.close();
                     return AudioDecodeResult.ENDED_BEFORE_AUDIO;
                 }
-                errors = new ErrorCollector(decoder.getErrorStream());
+                errors = new FfmpegErrorCollector(decoder.getErrorStream());
                 errors.start();
                 decoderOutput = decoder.getInputStream();
                 pcm = new byte[AUDIO_CHUNK_FRAMES * AUDIO_FRAME_SIZE];
@@ -3368,6 +3491,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     AUDIO_BUFFER_FRAMES * AUDIO_FRAME_SIZE);
             long decodedFrames = 0L;
             long lineBasePositionMs = decoderStartPosition;
+            long lineBaseFrame = 0L;
             boolean submittedAudio = false;
             boolean lineRunning = false;
             long nextVolumeUpdateNanos = 0L;
@@ -3384,7 +3508,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     if (audioRequestedSeekMs.get() >= 0L) {
                         return AudioDecodeResult.SEEK_REQUESTED;
                     }
-                    if (clientPaused || !playing || !clockStarted) {
+                    if (clientPaused || ((!playing || !clockStarted)
+                            && !isCatchingUp())) {
                         if (lineRunning) {
                             line.stop();
                             lineRunning = false;
@@ -3394,6 +3519,13 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         }
                         Thread.sleep(10L);
                         continue;
+                    }
+                    if (isCatchingUp() && lineRunning) {
+                        line.stop();
+                        line.flush();
+                        lineRunning = false;
+                        submittedAudio = false;
+                        audioEstablished = false;
                     }
                     if (submittedAudio && (!lineRunning || !line.isRunning())) {
                         line.start();
@@ -3436,6 +3568,29 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     long chunkEndMs = decoderStartPosition
                             + decodedFrames * 1000L / AUDIO_SAMPLE_RATE;
 
+                    long catchUpTargetMs = audioDropUntilPositionMs.get();
+                    if (catchUpTargetMs >= 0L) {
+                        if (lineRunning) {
+                            line.stop();
+                            line.flush();
+                            lineRunning = false;
+                        }
+                        submittedAudio = false;
+                        audioEstablished = false;
+                        if (chunkEndMs <= catchUpTargetMs) {
+                            statsDiscardedChunks++;
+                            continue;
+                        }
+                        if (!audioDropUntilPositionMs.compareAndSet(catchUpTargetMs, -1L)) {
+                            statsDiscardedChunks++;
+                            continue;
+                        }
+                        if (!playing || !clockStarted) {
+                            statsDiscardedChunks++;
+                            continue;
+                        }
+                    }
+
                     // Align only before starting the output line. Once playback begins,
                     // SourceDataLine must stay fed continuously to avoid audible underruns.
                     if (!submittedAudio && chunkEndMs <= positionMs()) {
@@ -3455,6 +3610,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
 
                     if (!submittedAudio) {
                         lineBasePositionMs = chunkPositionMs;
+                        lineBaseFrame = line.getLongFramePosition();
                     }
                     long now = System.nanoTime();
                     if (now >= nextVolumeUpdateNanos) {
@@ -3478,7 +3634,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     }
 
                     long rawPlayedPositionMs = lineBasePositionMs
-                            + line.getLongFramePosition() * 1000L / AUDIO_SAMPLE_RATE;
+                            + (line.getLongFramePosition() - lineBaseFrame)
+                            * 1000L / AUDIO_SAMPLE_RATE;
                     long clockPositionMs = positionMs();
                     long driftMs = clockPositionMs - rawPlayedPositionMs;
                     long statsNow = System.nanoTime();
@@ -3959,13 +4116,13 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             private final long preparation;
             private final long positionMs;
             private final Process process;
-            private final ErrorCollector errors;
+            private final FfmpegErrorCollector errors;
             private final InputStream output;
             private final byte[] firstChunk;
             private final int firstChunkBytes;
 
             private PreparedAudioDecoder(long preparation, long positionMs,
-                                         Process process, ErrorCollector errors,
+                                         Process process, FfmpegErrorCollector errors,
                                          InputStream output, byte[] firstChunk,
                                          int firstChunkBytes) {
                 this.preparation = preparation;
@@ -3979,47 +4136,4 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         }
     }
 
-    private static final class ErrorCollector {
-        private final InputStream input;
-        private final StringBuilder contents = new StringBuilder();
-        private final Thread thread;
-
-        private ErrorCollector(InputStream input) {
-            this.input = input;
-            this.thread = new Thread(this::read, "VideoSynchronizer-FFmpeg-stderr");
-            this.thread.setDaemon(true);
-        }
-
-        private void start() {
-            thread.start();
-        }
-
-        private void read() {
-            try (InputStreamReader reader = new InputStreamReader(input, StandardCharsets.UTF_8)) {
-                char[] buffer = new char[512];
-                int count;
-                while ((count = reader.read(buffer)) >= 0) {
-                    synchronized (contents) {
-                        int remaining = MAX_FFMPEG_ERROR_LENGTH - contents.length();
-                        if (remaining > 0) {
-                            contents.append(buffer, 0, Math.min(count, remaining));
-                        }
-                    }
-                }
-            } catch (IOException ignored) {
-                // The stream normally closes when a seek terminates the decoder process.
-            }
-        }
-
-        private void await() throws InterruptedException {
-            thread.join(1_000L);
-        }
-
-        private String text() {
-            synchronized (contents) {
-                return contents.toString().strip().replace('\r', ' ').replace('\n', ' ');
-            }
-        }
-
-    }
 }
