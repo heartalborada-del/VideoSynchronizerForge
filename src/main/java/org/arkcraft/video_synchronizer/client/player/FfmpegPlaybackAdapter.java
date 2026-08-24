@@ -2399,8 +2399,10 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     }
 
     private void addBufferedInputOptions(List<String> command) {
-        addNetworkInputOptions(command);
-        if (liveStream) {
+    addNetworkInputOptions(command);
+    if (liveStream) {
+        boolean lowLatency = Boolean.getBoolean("video_synchronizer.liveLowLatency");
+        if (lowLatency) {
             command.add("-fflags");
             command.add("nobuffer");
             command.add("-flags");
@@ -2409,14 +2411,28 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             command.add("direct");
             command.add("-max_delay");
             command.add("0");
+        } else {
+            // 增加缓冲大小和最大延迟，抵抗网络波动，缓解带宽压力喵
+            command.add("-buffer_size");
+            command.add("8192k");
+            command.add("-max_delay");
+            command.add("5000000"); // 5 秒
         }
-        command.add("-thread_queue_size");
-        command.add(Integer.toString(effectiveInputThreadQueuePackets()));
+    } else {
+        // 点播也适当增加缓冲喵
+        command.add("-buffer_size");
+        command.add("4096k");
+    }
+    command.add("-thread_queue_size");
+    command.add(Integer.toString(effectiveInputThreadQueuePackets()));
     }
 
     private int effectiveInputThreadQueuePackets() {
-        return liveStream ? Math.min(INPUT_THREAD_QUEUE_PACKETS, 64)
-                : INPUT_THREAD_QUEUE_PACKETS;
+    // 直播流也使用大的队列
+    if (liveStream) {
+        return Math.min(INPUT_THREAD_QUEUE_PACKETS, 128); // 原来的为 64喵
+    }
+    return INPUT_THREAD_QUEUE_PACKETS;
     }
 
     private boolean shouldRecoverLiveVideoLag(long lagMs) {
