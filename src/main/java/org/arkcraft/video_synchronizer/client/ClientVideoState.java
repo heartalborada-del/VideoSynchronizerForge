@@ -301,12 +301,11 @@ public final class ClientVideoState {
             return;
         }
         session.adapter = new FfmpegPlaybackAdapter(session.sessionId);
-        session.adapter.open(session.videoId, session.videoUrl, session.audioUrl,
+        session.adapter.openAt(session.videoId, session.videoUrl, session.audioUrl,
                 session.requestHeaders, session.cookie, session.disableScaling,
                 session.videoPipeLanes, session.videoPixelFormat, session.audioRange,
-                session.audioPlaybackMode, session.durationMs, session.live);
-        session.adapter.applyServerState(session.positionMs, session.playing,
-                session.waitingForClients, true);
+                session.audioPlaybackMode, session.durationMs, session.live,
+                session.positionMs, session.playing, session.waitingForClients);
         session.adapter.setClientPaused(clientPaused);
         session.readinessReported = false;
         session.ticksSinceReport = REPORT_INTERVAL_TICKS;
@@ -731,6 +730,18 @@ public final class ClientVideoState {
                   String cookie, boolean disableScaling, int videoPipeLanes,
                   VideoPixelFormat videoPixelFormat, double audioRange,
                   AudioPlaybackMode audioPlaybackMode, long durationMs, boolean live);
+
+        default void openAt(String videoId, String videoUrl, String audioUrl,
+                            String requestHeaders, String cookie, boolean disableScaling,
+                            int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                            double audioRange, AudioPlaybackMode audioPlaybackMode,
+                            long durationMs, boolean live, long positionMs, boolean playing,
+                            boolean waitingForClients) {
+            open(videoId, videoUrl, audioUrl, requestHeaders, cookie, disableScaling,
+                    videoPipeLanes, videoPixelFormat, audioRange, audioPlaybackMode,
+                    durationMs, live);
+            applyServerState(positionMs, playing, waitingForClients, true);
+        }
 
         void applyServerState(long positionMs, boolean playing, boolean waitingForClients,
                               boolean hardSeek);

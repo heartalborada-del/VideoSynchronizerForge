@@ -17,6 +17,7 @@ import org.lwjgl.system.MemoryUtil;
 import javax.annotation.Nullable;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -152,8 +153,8 @@ public final class ScreenTexture {
                 height = frame.height();
                 pixelFormat = frame.pixelFormat();
                 texture = new DynamicTexture(width, height, false);
-                location = Minecraft.getInstance().getTextureManager()
-                        .register("video_synchronizer_screen", texture);
+                location = textureLocation(sessionId);
+                Minecraft.getInstance().getTextureManager().register(location, texture);
                 createPixelBuffers(frame.data().length);
                 createdTexture = true;
                 Main.LOGGER.info("Created dynamic video texture {}x{} ({})",
@@ -251,6 +252,12 @@ public final class ScreenTexture {
 
     private static int unpackAlignment(VideoPixelFormat format) {
         return format == VideoPixelFormat.RGB24 ? 1 : 4;
+    }
+
+    private static ResourceLocation textureLocation(String sessionId) {
+        String safeSessionId = sessionId == null ? "unknown"
+                : sessionId.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9._-]", "_");
+        return ResourceLocation.fromNamespaceAndPath(Main.MODID, "screen/" + safeSessionId);
     }
 
     private void createPixelBuffers(int frameSize) {

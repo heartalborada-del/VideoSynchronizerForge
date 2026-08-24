@@ -98,12 +98,24 @@ Servers can override the default player permissions through Forge permission nod
 
 - New sessions and seeks wait for most online clients to become ready. Reconnecting and
   late-joining players automatically synchronize to the active session.
+- When playback is opened after `/video sync` or re-entering a screen's audio range, the
+  authoritative position is installed atomically before decoder startup. Immediately before
+  FFmpeg starts, playing sessions project that position by the time elapsed during media
+  probing; paused and preloading sessions keep the exact position.
+- Initial nonzero synchronization opens FFmpeg up to four seconds before that target, then
+  rapidly discards preroll audio and video without displaying it. This gives remote media a
+  usable earlier keyframe while the first visible frame still represents the current server time.
 - Clients validate both `ffmpeg` and `ffprobe` at startup. Clients that fail validation
   cannot play video and are excluded from preload thresholds and clock consensus.
 - Clients first use a bounded metadata probe to avoid excessive startup buffering for long
   media, then automatically retry with full analysis when the quick result is incomplete.
-- Media with audio and video in one URL uses one FFmpeg decoding process with separate raw
-  audio and video outputs. Configured split video/audio URLs use separate processes.
+- Media using one video output lane and one URL shares a single FFmpeg process for audio and
+  video. Multi-lane raw video uses an independent audio decoder from the same synchronized
+  position so audio backpressure cannot stop every video lane. Configured split video/audio
+  URLs also use separate processes.
+- Before the first video frame establishes the playback clock, shared audio output is
+  drained in partial reads and discarded. This prevents FFmpeg's shared audio socket from
+  applying backpressure when an arbitrary synchronized start emits audio before video.
 - If audio or video stalls, both streams recover together. On-demand media restarts from
   its synchronized position; live media reconnects at the current live edge.
 - Synchronization corrections switch audio and video together at the corrected position.
@@ -119,6 +131,9 @@ Servers can override the default player permissions through Forge permission nod
 - Falling behind the playback clock does not by itself restart FFmpeg. Bounded frame queues keep
   the newest useful video frame, while a decoder restart is reserved for confirmed output stalls
   or failures.
+- The first-frame timeout is an absolute deadline for a complete raw frame. Partial bytes cannot
+  indefinitely postpone recovery; after playback is established, stall timing follows the last
+  output progress instead.
 - Routine drift correction waits for a full five-second sample window and seeks only when
   the average offset remains at least 750 ms, avoiding startup corrections and seeks caused
   by isolated latency spikes.

@@ -185,29 +185,48 @@ public final class VideoUsagePolicy {
             return true;
         }
         String[] parts = host.split("\\.");
-        if (parts.length != 4) {
-            return false;
+        if (parts.length == 4) {
+            int[] values = new int[4];
+            for (int index = 0; index < parts.length; index++) {
+                if (parts[index].length() > 1 && parts[index].startsWith("0")) {
+                    return true;
+                }
+                try {
+                    values[index] = Integer.parseInt(parts[index]);
+                } catch (NumberFormatException exception) {
+                    values = null;
+                    break;
+                }
+                if (values[index] < 0 || values[index] > 255) {
+                    values = null;
+                    break;
+                }
+            }
+            if (values != null) {
+                return values[0] == 0 || values[0] == 10 || values[0] == 127
+                        || values[0] == 100 && values[1] >= 64 && values[1] <= 127
+                        || values[0] == 169 && values[1] == 254
+                        || values[0] == 172 && values[1] >= 16 && values[1] <= 31
+                        || values[0] == 192 && values[1] == 168
+                        || values[0] == 198 && (values[1] == 18 || values[1] == 19)
+                        || values[0] >= 224;
+            }
         }
-        int[] values = new int[4];
-        for (int index = 0; index < parts.length; index++) {
-            if (parts[index].length() > 1 && parts[index].startsWith("0")) {
-                return true;
+        try {
+            for (InetAddress address : InetAddress.getAllByName(host)) {
+                if (isPrivateAddress(address)) {
+                    return true;
+                }
             }
-            try {
-                values[index] = Integer.parseInt(parts[index]);
-            } catch (NumberFormatException exception) {
-                return false;
-            }
-            if (values[index] < 0 || values[index] > 255) {
-                return false;
-            }
+        } catch (UnknownHostException ignored) {
+            // The client may resolve a transient or split-horizon hostname differently.
         }
-        return values[0] == 0 || values[0] == 10 || values[0] == 127
-                || values[0] == 100 && values[1] >= 64 && values[1] <= 127
-                || values[0] == 169 && values[1] == 254
-                || values[0] == 172 && values[1] >= 16 && values[1] <= 31
-                || values[0] == 192 && values[1] == 168
-                || values[0] == 198 && (values[1] == 18 || values[1] == 19)
-                || values[0] >= 224;
+        return false;
+    }
+
+    private static boolean isPrivateAddress(InetAddress address) {
+        return address.isAnyLocalAddress() || address.isLoopbackAddress()
+                || address.isLinkLocalAddress() || address.isSiteLocalAddress()
+                || address.isMulticastAddress();
     }
 }
