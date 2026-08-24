@@ -65,6 +65,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             "video_synchronizer.videoPipeLanes", 2));
     private static final int VIDEO_PIPE_MIN_FRAME_BYTES = positiveIntegerProperty(
             "video_synchronizer.videoPipeMinFrameBytes", 4 * 1024 * 1024);
+    private static final int VIDEO_PIPE_TARGET_BYTES_PER_SECOND = positiveIntegerProperty(
+            "video_synchronizer.videoPipeTargetBytesPerSecond", 64 * 1024 * 1024);
     private static final int VIDEO_PIPE_SOCKET_BUFFER_BYTES = positiveIntegerProperty(
             "video_synchronizer.videoPipeSocketBufferBytes", 8 * 1024 * 1024);
     private static final int VIDEO_PIPE_ACCEPT_TIMEOUT_MS = positiveIntegerProperty(
@@ -104,6 +106,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static final long AUDIO_RECONNECT_NOTICE_MS = 500L;
     private static final long AUDIO_START_TIMEOUT_MS = 20_000L;
     private static final long AUDIO_STALL_TIMEOUT_MS = 5_000L;
+    private static final long LIVE_AUDIO_DRIFT_THRESHOLD_MS = 1_500L;
+    private static final long LIVE_AUDIO_DRIFT_GRACE_MS = 5_000L;
     private static final long AUDIO_RECOVERY_STABLE_FRAMES = AUDIO_SAMPLE_RATE * 5L;
     private static final int VIDEO_MAX_RECONNECT_ATTEMPTS = 5;
     private static final long VIDEO_RECONNECT_NOTICE_MS = 2_000L;
@@ -111,6 +115,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static final long VIDEO_STALL_TIMEOUT_MS = positiveIntegerProperty(
             "video_synchronizer.videoStallTimeoutMs", 20_000);
     private static final long VIDEO_RECOVERY_STABLE_NANOS = TimeUnit.SECONDS.toNanos(5L);
+    private static final long LIVE_VIDEO_STALL_TIMEOUT_MS = 5_000L;
+    private static final long LIVE_VIDEO_DROP_LAG_MS = 750L;
+    private static final long LIVE_VIDEO_FRAME_LATENCY_DROP_MS = 750L;
+    private static final long LIVE_VIDEO_FRAME_LATENCY_RECOVERY_MS = 2_000L;
+    private static final long LIVE_VIDEO_RECOVERY_LAG_MS = 5_000L;
+    private static final long LIVE_VIDEO_RECOVERY_GRACE_MS = 2_000L;
     private static final long FORWARD_DROP_MIN_DISTANCE_MS = 750L;
     private static final long FORWARD_DROP_MAX_DISTANCE_MS = 30_000L;
     private static final long FORWARD_DROP_LEAD_MS = 2_000L;
@@ -196,6 +206,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private volatile long dropStartedNanos;
     private volatile boolean dropClockPlaying;
     private volatile long lastVideoFrameNanos;
+    private volatile long liveVideoLagStartedNanos;
     private volatile SpatialAudioState spatialAudioState = SpatialAudioState.FULL_VOLUME;
 
     public FfmpegPlaybackAdapter(String sessionId) {
@@ -230,7 +241,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         + "videoPipeLanes={}->{}, pixelFormat={}, "
                         + "readiness=first-verified-frame, "
                         + "hardware={}, cudaScale={}, separateAudio={}, customHeaders={}, "
-                        + "cookieConfigured={}",
+                        + "cookieConfigured={}, liveLowLatency={}, inputQueuePackets={}",
                 sessionGeneration, videoId, durationMs, SCALE_VIDEO, disableScaling,
                 MAX_OUTPUT_WIDTH,
                 MAX_OUTPUT_HEIGHT, MAX_OUTPUT_FPS, videoPipeLanes, resolvedVideoPipeLanes,
@@ -238,7 +249,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 System.getProperty("video_synchronizer.ffmpegHardware", "true"),
                 System.getProperty("video_synchronizer.ffmpegCudaScale", "false"),
                 audioUrl != null && !audioUrl.isBlank(), !requestOptions.headers().isBlank(),
-                !requestOptions.cookie().isBlank());
+                !requestOptions.cookie().isBlank(), live,
+                live ? Math.min(INPUT_THREAD_QUEUE_PACKETS, 64) : INPUT_THREAD_QUEUE_PACKETS);
         destroyProcess();
         audioPlayback.close();
         frameBuffer.clear();
@@ -261,6 +273,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         this.preloadDiagnosticsLogged = false;
         this.videoReconnecting = false;
         this.lastVideoFrameNanos = 0L;
+        this.liveVideoLagStartedNanos = 0L;
         this.spatialAudioState = SpatialAudioState.SILENT;
         this.activeMetadata = null;
         this.activeMediaUrl = videoUrl;
@@ -526,7 +539,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 preloadStartedNanos == 0L ? 0L
                         : (System.nanoTime() - preloadStartedNanos) / 1_000_000L,
                 preloadDecodedFrames, decodedSpanMs, verifiedPreloadMediaMs,
-                bufferStats.pendingFrame(), INPUT_THREAD_QUEUE_PACKETS);
+                bufferStats.pendingFrame(), effectiveInputThreadQueuePackets());
     }
 
     @Override
@@ -610,6 +623,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         preloadDiagnosticsLogged = false;
         videoReconnecting = false;
         lastVideoFrameNanos = 0L;
+        liveVideoLagStartedNanos = 0L;
         spatialAudioState = SpatialAudioState.SILENT;
         requestedSeekMs.set(-1L);
         initialPositionReceivedNanos = 0L;
@@ -682,10 +696,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             boolean needsScaling = output.width != metadata.width
                     || output.height != metadata.height;
             boolean limitsFrameRate = metadata.framesPerSecond > MAX_OUTPUT_FPS;
+            double outputFps = outputFramesPerSecond(metadata);
             int frameSize = Math.multiplyExact(
                     Math.multiplyExact(output.width, output.height),
                     activeVideoPixelFormat.bytesPerPixel());
-            int outputLanes = effectiveVideoPipeLanes(frameSize, output.height);
+            int outputLanes = effectiveVideoPipeLanes(frameSize, output.height,
+                    pipeSizingFrameRate(outputFps));
             boolean hasAudio = metadata.hasAudio || separateAudioUrl != null;
             shareAudioWithVideo = metadata.hasAudio
                     && separateAudioUrl == null && outputLanes <= 1;
@@ -956,13 +972,15 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                                 PreparedVideoDecoder preparedDecoder,
                                 boolean allowStripedOutput)
             throws IOException, InterruptedException {
-        double outputFps = Math.max(1.0D, Math.min(MAX_OUTPUT_FPS, metadata.framesPerSecond));
+        double outputFps = outputFramesPerSecond(metadata);
         double frameDurationMs = 1000.0D / outputFps;
+        long videoStallTimeoutMs = effectiveVideoStallTimeoutMs();
         OutputDimensions outputDimensions = outputDimensions(metadata.width, metadata.height,
                 disableScaling);
         boolean needsScaling = outputDimensions.width != metadata.width
                 || outputDimensions.height != metadata.height;
         boolean limitsFrameRate = metadata.framesPerSecond > MAX_OUTPUT_FPS;
+        boolean normalizesFrameRate = limitsFrameRate;
         VideoPixelFormat pixelFormat = activeVideoPixelFormat;
         int frameSize = Math.multiplyExact(
                 Math.multiplyExact(outputDimensions.width, outputDimensions.height),
@@ -972,7 +990,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 && shareAudioWithVideo
                 ? SharedAudioOutput.create() : null;
         int requestedPipeLanes = allowStripedOutput && preparedDecoder == null
-                ? effectiveVideoPipeLanes(frameSize, outputDimensions.height) : 1;
+                ? effectiveVideoPipeLanes(frameSize, outputDimensions.height,
+                pipeSizingFrameRate(outputFps)) : 1;
         if (requestedPipeLanes > 1) {
             try {
                 stripedOutput = StripedVideoOutput.create(
@@ -1014,12 +1033,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             videoFilters.add("hwdownload");
             videoFilters.add("format=nv12");
-            if (limitsFrameRate) {
+            if (normalizesFrameRate) {
                 videoFilters.add(String.format(Locale.ROOT, "fps=%.3f", outputFps));
             }
             videoFilters.add("format=" + pixelFormat.ffmpegName());
         } else {
-            if (limitsFrameRate) {
+            if (normalizesFrameRate) {
                 videoFilters.add(String.format(Locale.ROOT, "fps=%.3f", outputFps));
             }
             if (needsScaling && !disableScaling) {
@@ -1111,6 +1130,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         long statsFirstByteDelayNanos = 0L;
         long statsReadCalls = 0L;
         long statsEmptyPolls = 0L;
+        long statsLiveDroppedFrames = 0L;
         boolean streamStalled = false;
         FrameReadResult lastReadResult = null;
         Main.LOGGER.debug("Started FFmpeg video process: pid={}, generation={}, mode={}, "
@@ -1121,13 +1141,14 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 decoder.pid(), sessionGeneration, mode.description, startPosition,
                 decoderStartPosition,
                 outputDimensions.width, outputDimensions.height, outputFps, frameSize,
-                needsScaling, limitsFrameRate,
+                needsScaling, normalizesFrameRate,
                 stripedOutput == null ? 1 : stripedOutput.laneCount(),
                 pixelFormat,
                 videoFilters.isEmpty() ? "none" : String.join(",", videoFilters),
-                preparedDecoder != null, VIDEO_STALL_TIMEOUT_MS,
+                preparedDecoder != null, videoStallTimeoutMs,
                 processAcquireNanos / 1_000_000.0D);
         long framePosition = decoderStartPosition;
+        long liveFrameOriginNanos = -1L;
         int decodedFrames = 0;
         boolean submittedFrame = false;
         String processErrors = "";
@@ -1152,10 +1173,10 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             FrameReadResult.FRAME, frameSize, 0L, 1, 0L);
                 } else if (lanes != null) {
                     readOutcome = readStripedFrame(lanes, frameData, decoder, sessionGeneration,
-                            decodedFrames == 0 ? VIDEO_START_TIMEOUT_MS : VIDEO_STALL_TIMEOUT_MS);
+                            decodedFrames == 0 ? VIDEO_START_TIMEOUT_MS : videoStallTimeoutMs);
                 } else {
                     readOutcome = readFrame(output, frameData, decoder, sessionGeneration,
-                            decodedFrames == 0 ? VIDEO_START_TIMEOUT_MS : VIDEO_STALL_TIMEOUT_MS);
+                            decodedFrames == 0 ? VIDEO_START_TIMEOUT_MS : videoStallTimeoutMs);
                 }
                 FrameReadResult readResult = readOutcome.result;
                 lastReadResult = readResult;
@@ -1200,7 +1221,72 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             ? DecodeResult.SEEK_REQUESTED : DecodeResult.ENDED;
                 }
 
+                if (liveStream && clockStarted && playing
+                        && readNanos >= TimeUnit.MILLISECONDS.toNanos(
+                        LIVE_VIDEO_FRAME_LATENCY_DROP_MS)) {
+                    long frameLatencyMs = TimeUnit.NANOSECONDS.toMillis(readNanos);
+                    frameBuffer.release(new VideoFrameBuffer.DecodedFrame(
+                            outputDimensions.width, outputDimensions.height,
+                            decodedPositionMs, pixelFormat, frameData));
+                    decodedFrames++;
+                    statsLiveDroppedFrames++;
+                    statsDecodedFrames++;
+                    statsReadNanos += readNanos;
+                    statsMaximumReadNanos = Math.max(statsMaximumReadNanos, readNanos);
+                    statsFirstByteDelayNanos += readOutcome.firstByteDelayNanos;
+                    statsReadCalls += readOutcome.readCalls;
+                    statsEmptyPolls += readOutcome.emptyPolls;
+                    Main.LOGGER.debug("Discarding stale live video frame: pid={}, latency={} ms, "
+                                    + "threshold={} ms, decodedFrames={}",
+                            decoder.pid(), frameLatencyMs, LIVE_VIDEO_FRAME_LATENCY_DROP_MS,
+                            decodedFrames);
+                    if (frameLatencyMs >= LIVE_VIDEO_FRAME_LATENCY_RECOVERY_MS
+                            && requestCoordinatedRecovery(sessionGeneration,
+                            "stale live video frame")) {
+                        return DecodeResult.SEEK_REQUESTED;
+                    }
+                    framePosition = decoderStartPosition
+                            + TimeUnit.NANOSECONDS.toMillis(
+                            Math.max(0L, System.nanoTime() - liveFrameOriginNanos));
+                    continue;
+                }
+
+                if (liveStream) {
+                    long nowNanos = System.nanoTime();
+                    if (liveFrameOriginNanos < 0L) {
+                        liveFrameOriginNanos = nowNanos;
+                    }
+                    // Rawvideo carries no PTS. Live output cadence is variable, so frame
+                    // count multiplied by probe FPS would accumulate a false clock drift.
+                    framePosition = decoderStartPosition + TimeUnit.NANOSECONDS.toMillis(
+                            Math.max(0L, nowNanos - liveFrameOriginNanos));
+                }
                 long playbackPosition = positionMs();
+                if (liveStream && clockStarted && playing
+                        && playbackPosition - framePosition > LIVE_VIDEO_DROP_LAG_MS) {
+                    long lagMs = playbackPosition - framePosition;
+                    frameBuffer.release(new VideoFrameBuffer.DecodedFrame(
+                            outputDimensions.width, outputDimensions.height,
+                            framePosition, pixelFormat, frameData));
+                    decodedPositionMs = framePosition;
+                    decodedFrames++;
+                    statsLiveDroppedFrames++;
+                    statsDecodedFrames++;
+                    statsReadNanos += readNanos;
+                    statsMaximumReadNanos = Math.max(statsMaximumReadNanos, readNanos);
+                    statsFirstByteDelayNanos += readOutcome.firstByteDelayNanos;
+                    statsReadCalls += readOutcome.readCalls;
+                    statsEmptyPolls += readOutcome.emptyPolls;
+                    if (shouldRecoverLiveVideoLag(lagMs)
+                            && requestCoordinatedRecovery(sessionGeneration,
+                            "sustained live video lag")) {
+                        return DecodeResult.SEEK_REQUESTED;
+                    }
+                    framePosition = decoderStartPosition
+                            + Math.round(decodedFrames * frameDurationMs);
+                    continue;
+                }
+                liveVideoLagStartedNanos = 0L;
                 long requiredFramePosition = -1L;
                 // Server-coordinated seeks pause while clients preload. The replacement
                 // decoder must still discard frames decoded behind the projected target.
@@ -1233,8 +1319,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 long pacingStartNanos = System.nanoTime();
                 boolean startingSynchronizedClock = !clockStarted
                         && (preparedDecoder != null || dropTargetMs >= 0L);
+                // Live rawvideo has no reliable PTS. Its arrival cadence is the live clock;
+                // waiting for a frame position to reach the local clock would double-pace
+                // bursty output and can reduce a healthy stream to a few frames per second.
                 while (generation.get() == sessionGeneration && requestedSeekMs.get() < 0L
-                        && !startingSynchronizedClock
+                        && !liveStream && !startingSynchronizedClock
                         && framePosition > positionMs() + 75L) {
                     Thread.sleep(5L);
                 }
@@ -1306,7 +1395,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                                     + "rawOutput={} MiB/s), totalFrames={}, media={} ms, clock={} ms, "
                                     + "drift={} ms, readAvg={} ms, readMax={} ms, pacing={} ms, "
                                     + "firstByteAvg={} ms, readCalls={}, emptyPolls={}, "
-                                    + "bufferPending={}, submitted={}, replaced={}, taken={}",
+                                    + "bufferPending={}, submitted={}, replaced={}, taken={}, "
+                                    + "liveDropped={}",
                             decoder.pid(), mode.description, statsDecodedFrames, decodeFps,
                             rawOutputMiB, decodedFrames, framePosition, clockPosition,
                             framePosition - clockPosition, averageReadMs,
@@ -1314,7 +1404,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             statsPacingNanos / 1_000_000.0D, averageFirstByteMs,
                             statsReadCalls, statsEmptyPolls, bufferStats.pendingFrame(),
                             bufferStats.submittedFrames(), bufferStats.replacedFrames(),
-                            bufferStats.takenFrames());
+                            bufferStats.takenFrames(), statsLiveDroppedFrames);
                     statsStartNanos = statsNow;
                     statsDecodedFrames = 0L;
                     statsReadNanos = 0L;
@@ -1323,8 +1413,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     statsFirstByteDelayNanos = 0L;
                     statsReadCalls = 0L;
                     statsEmptyPolls = 0L;
+                    statsLiveDroppedFrames = 0L;
                 }
-                framePosition = decoderStartPosition + Math.round(decodedFrames * frameDurationMs);
+                if (!liveStream) {
+                    framePosition = decoderStartPosition
+                            + Math.round(decodedFrames * frameDurationMs);
+                }
             }
         } finally {
             terminateProcessTree(decoder);
@@ -1615,6 +1709,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         clockStarted = false;
         playbackGeneration.incrementAndGet();
         clearFrameDropTarget();
+        liveVideoLagStartedNanos = 0L;
         frameBuffer.clear();
         activatedSeekPreparation = preparation;
         audioPlayback.activatePreparedSeek(preparation, positionMs,
@@ -1752,12 +1847,38 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         return modes;
     }
 
-    private int effectiveVideoPipeLanes(int frameSize, int frameHeight) {
-        if (activeVideoPipeLanes <= 1
-                || (!forceVideoPipeLanes && frameSize < VIDEO_PIPE_MIN_FRAME_BYTES)) {
+    private int effectiveVideoPipeLanes(int frameSize, int frameHeight, double outputFps) {
+        if (forceVideoPipeLanes) {
+            return Math.max(1, Math.min(activeVideoPipeLanes, frameHeight));
+        }
+        long outputBytesPerSecond = (long) Math.ceil(frameSize * outputFps);
+        if (frameSize < VIDEO_PIPE_MIN_FRAME_BYTES
+                && outputBytesPerSecond <= VIDEO_PIPE_TARGET_BYTES_PER_SECOND) {
             return 1;
         }
-        return Math.max(1, Math.min(activeVideoPipeLanes, frameHeight));
+        long requiredLanes = (outputBytesPerSecond
+                + VIDEO_PIPE_TARGET_BYTES_PER_SECOND - 1L)
+                / VIDEO_PIPE_TARGET_BYTES_PER_SECOND;
+        int automaticLanes = 1;
+        while (automaticLanes < requiredLanes && automaticLanes < MAX_VIDEO_PIPE_LANES) {
+            automaticLanes <<= 1;
+        }
+        automaticLanes = Math.max(automaticLanes, activeVideoPipeLanes);
+        return Math.max(1, Math.min(automaticLanes,
+                Math.min(MAX_VIDEO_PIPE_LANES, frameHeight)));
+    }
+
+    private long effectiveVideoStallTimeoutMs() {
+        return liveStream ? Math.min(VIDEO_STALL_TIMEOUT_MS, LIVE_VIDEO_STALL_TIMEOUT_MS)
+                : VIDEO_STALL_TIMEOUT_MS;
+    }
+
+    private double pipeSizingFrameRate(double outputFps) {
+        return liveStream ? MAX_OUTPUT_FPS : outputFps;
+    }
+
+    private static double outputFramesPerSecond(VideoMetadata metadata) {
+        return Math.max(1.0D, Math.min(MAX_OUTPUT_FPS, metadata.framesPerSecond));
     }
 
     private static int resolveVideoPipeLanes(int requestedLanes) {
@@ -1790,6 +1911,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         if (!videoFilters.isEmpty()) {
             graph.append(String.join(",", videoFilters)).append(',');
         }
+        // Crop only after packing pixels so every lane has exact byte-aligned row boundaries.
+        String outputFormatFilter = "format=" + pixelFormat.ffmpegName();
+        if (videoFilters.isEmpty()
+                || !outputFormatFilter.equals(videoFilters.get(videoFilters.size() - 1))) {
+            graph.append(outputFormatFilter).append(',');
+        }
         graph.append("split=").append(stripedOutput.laneCount());
         for (int lane = 0; lane < stripedOutput.laneCount(); lane++) {
             graph.append("[video_pipe_source_").append(lane).append(']');
@@ -1798,7 +1925,6 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             graph.append(";[video_pipe_source_").append(stripe.index()).append(']')
                     .append("crop=").append(output.width).append(':')
                     .append(stripe.height()).append(":0:").append(stripe.y())
-                    .append(",format=").append(pixelFormat.ffmpegName())
                     .append("[video_pipe_output_")
                     .append(stripe.index()).append(']');
         }
@@ -1841,10 +1967,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private VideoCommand createVideoCommand(String mediaUrl, VideoMetadata metadata,
                                              long startPosition, DecodeMode mode) {
         VideoPixelFormat pixelFormat = activeVideoPixelFormat;
-        double outputFps = Math.max(1.0D, Math.min(MAX_OUTPUT_FPS, metadata.framesPerSecond));
+        double outputFps = outputFramesPerSecond(metadata);
         OutputDimensions output = outputDimensions(metadata.width, metadata.height, disableScaling);
         boolean needsScaling = output.width != metadata.width || output.height != metadata.height;
         boolean limitsFrameRate = metadata.framesPerSecond > MAX_OUTPUT_FPS;
+        boolean normalizesFrameRate = limitsFrameRate;
         List<String> command = new ArrayList<>();
         command.add(ffmpegExecutable());
         command.add("-hide_banner");
@@ -1875,12 +2002,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             filters.add("hwdownload");
             filters.add("format=nv12");
-            if (limitsFrameRate) {
+            if (normalizesFrameRate) {
                 filters.add(String.format(Locale.ROOT, "fps=%.3f", outputFps));
             }
             filters.add("format=" + pixelFormat.ffmpegName());
         } else {
-            if (limitsFrameRate) {
+            if (normalizesFrameRate) {
                 filters.add(String.format(Locale.ROOT, "fps=%.3f", outputFps));
             }
             if (needsScaling && !disableScaling) {
@@ -2042,8 +2169,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         command.add("-of");
         command.add("json");
         command.add(mediaUrl);
-        Process probe = EmbeddedFfmpeg.processBuilder(command)
-                .redirectErrorStream(true).start();
+        Process probe = EmbeddedFfmpeg.processBuilder(command).start();
+        FfmpegErrorCollector errors = new FfmpegErrorCollector(probe.getErrorStream());
+        errors.start();
         Main.LOGGER.debug("Started {} ffprobe process: pid={}, generation={}",
                 fastProbe ? "fast" : "full", probe.pid(), sessionGeneration);
         if (!registerProcess(probe, sessionGeneration, false)) {
@@ -2079,8 +2207,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             String probeOutput = new String(
                     probe.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            errors.await();
             if (probe.exitValue() != 0) {
-                int httpStatus = findHttpErrorStatus(probeOutput);
+                int httpStatus = findHttpErrorStatus(errors.text());
                 if (httpStatus >= 0) {
                     throw new HttpStatusException(httpStatus);
                 }
@@ -2163,8 +2292,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         command.add("-of");
         command.add("json");
         command.add(mediaUrl);
-        Process probe = EmbeddedFfmpeg.processBuilder(command)
-                .redirectErrorStream(true).start();
+        Process probe = EmbeddedFfmpeg.processBuilder(command).start();
+        FfmpegErrorCollector errors = new FfmpegErrorCollector(probe.getErrorStream());
+        errors.start();
         if (!registerProcess(probe, sessionGeneration, false)) {
             terminateProcessTree(probe);
             throw new IOException("Video session was cancelled");
@@ -2183,8 +2313,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             String output = new String(probe.getInputStream().readAllBytes(),
                     StandardCharsets.UTF_8);
+            errors.await();
             if (probe.exitValue() != 0) {
-                int httpStatus = findHttpErrorStatus(output);
+                int httpStatus = findHttpErrorStatus(errors.text());
                 if (httpStatus >= 0) {
                     throw new HttpStatusException(httpStatus);
                 }
@@ -2269,8 +2400,38 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
 
     private void addBufferedInputOptions(List<String> command) {
         addNetworkInputOptions(command);
+        if (liveStream) {
+            command.add("-fflags");
+            command.add("nobuffer");
+            command.add("-flags");
+            command.add("low_delay");
+            command.add("-avioflags");
+            command.add("direct");
+            command.add("-max_delay");
+            command.add("0");
+        }
         command.add("-thread_queue_size");
-        command.add(Integer.toString(INPUT_THREAD_QUEUE_PACKETS));
+        command.add(Integer.toString(effectiveInputThreadQueuePackets()));
+    }
+
+    private int effectiveInputThreadQueuePackets() {
+        return liveStream ? Math.min(INPUT_THREAD_QUEUE_PACKETS, 64)
+                : INPUT_THREAD_QUEUE_PACKETS;
+    }
+
+    private boolean shouldRecoverLiveVideoLag(long lagMs) {
+        if (!liveStream || lagMs < LIVE_VIDEO_RECOVERY_LAG_MS) {
+            liveVideoLagStartedNanos = 0L;
+            return false;
+        }
+        long nowNanos = System.nanoTime();
+        long startedNanos = liveVideoLagStartedNanos;
+        if (startedNanos == 0L) {
+            liveVideoLagStartedNanos = nowNanos;
+            return false;
+        }
+        return nowNanos - startedNanos
+                >= TimeUnit.MILLISECONDS.toNanos(LIVE_VIDEO_RECOVERY_GRACE_MS);
     }
 
     private void addInputSeek(List<String> command, long startPosition) {
@@ -3048,6 +3209,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         private volatile boolean audioEstablished;
         private volatile boolean reconnecting;
         private volatile long lastOutputProgressNanos;
+        private volatile long liveDriftStartedNanos;
 
         private synchronized void open(long sessionGeneration, String url, long startPositionMs) {
             Main.LOGGER.debug("Opening synchronized audio: generation={}, start={} ms",
@@ -3057,6 +3219,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             audioEstablished = false;
             reconnecting = false;
             lastOutputProgressNanos = 0L;
+            liveDriftStartedNanos = 0L;
             audioRequestedSeekMs.set(startPositionMs);
             audioDropUntilPositionMs.set(-1L);
             startWorkerLocked();
@@ -3072,6 +3235,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             audioEstablished = false;
             reconnecting = false;
             lastOutputProgressNanos = 0L;
+            liveDriftStartedNanos = 0L;
             audioRequestedSeekMs.set(-1L);
             audioDropUntilPositionMs.set(-1L);
             executor.execute(() -> playSharedAudio(
@@ -3109,6 +3273,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             audioEstablished = false;
             reconnecting = false;
             lastOutputProgressNanos = 0L;
+            liveDriftStartedNanos = 0L;
             audioRequestedSeekMs.set(-1L);
             audioDropUntilPositionMs.set(-1L);
             executor.execute(() -> playSharedAudio(sessionGeneration, prepared.input(), decoder,
@@ -3121,6 +3286,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             Main.LOGGER.debug("Seeking synchronized audio: generation={}, position={} ms",
                     activeGeneration, positionMs);
+            liveDriftStartedNanos = 0L;
             audioRequestedSeekMs.set(positionMs);
             audioDropUntilPositionMs.set(-1L);
             closeSharedInputLocked();
@@ -3244,6 +3410,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             } else {
                 activatedSeekPreparation = preparation;
             }
+            liveDriftStartedNanos = 0L;
             audioRequestedSeekMs.set(positionMs);
             audioDropUntilPositionMs.set(-1L);
             destroyAudioProcessLocked();
@@ -3270,6 +3437,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             audioEstablished = false;
             reconnecting = false;
             lastOutputProgressNanos = 0L;
+            liveDriftStartedNanos = 0L;
             audioRequestedSeekMs.set(-1L);
             audioDropUntilPositionMs.set(-1L);
             closeSharedInputLocked();
@@ -3444,6 +3612,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             + (line.getLongFramePosition() - lineBaseFrame)
                             * 1000L / AUDIO_SAMPLE_RATE;
                     lastOutputProgressNanos = System.nanoTime();
+                    long driftMs = positionMs() - playedPositionMs;
+                    if (hasSustainedLiveAudioDrift(driftMs)
+                            && requestCoordinatedRecovery(
+                            sessionGeneration, "sustained live audio drift")) {
+                        return;
+                    }
                     if (Math.abs(positionMs() - playedPositionMs) > AUDIO_STALL_TIMEOUT_MS) {
                         resetOutputProgress();
                     }
@@ -3845,6 +4019,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             * 1000L / AUDIO_SAMPLE_RATE;
                     long clockPositionMs = positionMs();
                     long driftMs = clockPositionMs - rawPlayedPositionMs;
+                    if (hasSustainedLiveAudioDrift(driftMs)
+                            && requestCoordinatedRecovery(
+                            sessionGeneration, "sustained live audio drift")) {
+                        return AudioDecodeResult.SEEK_REQUESTED;
+                    }
                     long statsNow = System.nanoTime();
                     long statsElapsedNanos = statsNow - statsStartNanos;
                     if (statsElapsedNanos >= DEBUG_INTERVAL_NANOS) {
@@ -4121,6 +4300,21 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
 
         private void resetOutputProgress() {
             lastOutputProgressNanos = System.nanoTime();
+        }
+
+        private boolean hasSustainedLiveAudioDrift(long driftMs) {
+            if (!liveStream || Math.abs(driftMs) < LIVE_AUDIO_DRIFT_THRESHOLD_MS) {
+                liveDriftStartedNanos = 0L;
+                return false;
+            }
+            long nowNanos = System.nanoTime();
+            long startedNanos = liveDriftStartedNanos;
+            if (startedNanos == 0L) {
+                liveDriftStartedNanos = nowNanos;
+                return false;
+            }
+            return nowNanos - startedNanos
+                    >= TimeUnit.MILLISECONDS.toNanos(LIVE_AUDIO_DRIFT_GRACE_MS);
         }
 
         private void closeAudioLine(SourceDataLine line) {
