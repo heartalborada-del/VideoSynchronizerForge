@@ -28,6 +28,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -84,15 +85,38 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             "video_synchronizer.fullAnalyzeDurationUs", 15_000_000);
     private static final int INPUT_THREAD_QUEUE_PACKETS = positiveIntegerProperty(
             "video_synchronizer.inputThreadQueuePackets", 512);
+    /* Match VLC's recovery behavior by dropping damaged packets and continuing at the next frame. */
+    private static final boolean DISCARD_CORRUPT_PACKETS = Boolean.parseBoolean(
+            System.getProperty("video_synchronizer.ffmpegDiscardCorrupt", "true"));
     private static final String NETWORK_TIMEOUT_US = "15000000";
     private static final String HTTP_SHORT_SEEK_SIZE = "1048576";
-    private static final int AUDIO_SAMPLE_RATE = 48_000;
+    private static final int AUDIO_SAMPLE_RATE = audioSampleRateProperty();
     private static final int AUDIO_CHANNELS = 2;
     private static final double DEFAULT_AUDIO_MAX_DISTANCE = positiveDoubleProperty(
             "video_synchronizer.audioMaxDistance", 48.0D);
     private static final int AUDIO_FRAME_SIZE = AUDIO_CHANNELS * Short.BYTES;
     private static final int AUDIO_CHUNK_FRAMES = AUDIO_SAMPLE_RATE / 50;
-    private static final int AUDIO_BUFFER_FRAMES = AUDIO_SAMPLE_RATE / 10;
+    private static final int AUDIO_BUFFER_FRAMES = Math.max(AUDIO_CHUNK_FRAMES,
+            AUDIO_SAMPLE_RATE * positiveIntegerProperty(
+                    "video_synchronizer.audioLineBufferMs", 1_000) / 1000);
+    /* Each chunk is 20 ms at the fixed 50 Hz reader cadence; cap the queue at about 10 s. */
+    private static final int AUDIO_PCM_QUEUE_CHUNKS = Math.min(500, positiveIntegerProperty(
+            "video_synchronizer.audioPcmQueueChunks", 500));
+    private static final boolean LOW_LATENCY_LIVE_AUDIO = Boolean.parseBoolean(
+            System.getProperty("video_synchronizer.lowLatencyLiveAudio", "true"));
+    private static final boolean LOW_LATENCY_LIVE_VIDEO = Boolean.parseBoolean(
+            System.getProperty("video_synchronizer.lowLatencyLiveVideo", "false"));
+    private static final boolean REALTIME_LIVE_INPUT = Boolean.parseBoolean(
+            System.getProperty("video_synchronizer.ffmpegRealtimeInput", "false"));
+    private static final boolean WALLCLOCK_LIVE_INPUT_TIMESTAMPS = Boolean.parseBoolean(
+            System.getProperty("video_synchronizer.ffmpegWallclockTimestamps", "false"));
+    private static final int LIVE_INPUT_RTBUF_SIZE_BYTES = positiveIntegerProperty(
+            "video_synchronizer.liveInputRtbufSizeBytes", 512 * 1024);
+    /* Keep enough probe data for RTMP/HLS headers; callers can opt into the 32-byte minimum. */
+    private static final int LIVE_AUDIO_PROBE_SIZE_BYTES = positiveIntegerProperty(
+            "video_synchronizer.liveAudioProbeSizeBytes", 32 * 1024);
+    private static final long LIVE_AUDIO_ANALYZE_DURATION_US = nonNegativeLongProperty(
+            "video_synchronizer.liveAudioAnalyzeDurationUs", 1_000_000L);
     private static final int AUDIO_READ_CANCELLED = -1;
     private static final int AUDIO_READ_STALLED = -2;
     private static final int HTTP_FORBIDDEN_STATUS = 403;
@@ -101,8 +125,13 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static final long STREAM_RECONNECT_INITIAL_DELAY_MS = 250L;
     private static final long STREAM_RECONNECT_MAX_DELAY_MS = 4_000L;
     private static final long AUDIO_END_TOLERANCE_MS = 1_000L;
-    private static final long AUDIO_RECONNECT_NOTICE_MS = 500L;
+    /* Ignore sub-1.5-second audio gaps when reporting a recovered connection. */
+    private static final long AUDIO_RECONNECT_NOTICE_MS = positiveLongProperty(
+            "video_synchronizer.audioReconnectNoticeMs", 1_500L);
     private static final long AUDIO_START_TIMEOUT_MS = 20_000L;
+    /* Live HLS audio can leave a short segment gap while video continues normally. */
+    private static final long AUDIO_INPUT_STALL_TIMEOUT_MS = positiveLongProperty(
+            "video_synchronizer.audioInputStallTimeoutMs", 10_000L);
     private static final long AUDIO_STALL_TIMEOUT_MS = 5_000L;
     private static final long AUDIO_RECOVERY_STABLE_FRAMES = AUDIO_SAMPLE_RATE * 5L;
     private static final int VIDEO_MAX_RECONNECT_ATTEMPTS = 5;
@@ -682,13 +711,15 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             boolean needsScaling = output.width != metadata.width
                     || output.height != metadata.height;
             boolean limitsFrameRate = metadata.framesPerSecond > MAX_OUTPUT_FPS;
+            boolean normalizeFrameRate = liveStream || limitsFrameRate;
             int frameSize = Math.multiplyExact(
                     Math.multiplyExact(output.width, output.height),
                     activeVideoPixelFormat.bytesPerPixel());
             int outputLanes = effectiveVideoPipeLanes(frameSize, output.height);
             boolean hasAudio = metadata.hasAudio || separateAudioUrl != null;
             shareAudioWithVideo = metadata.hasAudio
-                    && separateAudioUrl == null && outputLanes <= 1;
+                    && separateAudioUrl == null && outputLanes <= 1
+                    && !DISCARD_CORRUPT_PACKETS;
             String audioDecoderMode = !hasAudio ? "disabled"
                     : shareAudioWithVideo ? "shared" : "independent";
             Main.LOGGER.info("Streaming media decoder opened {}x{} at {} fps "
@@ -699,7 +730,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     metadata.codecName, metadata.profile, metadata.pixelFormat,
                     metadata.bitRate,
                     output.width, output.height, needsScaling ? "enabled" : "bypassed",
-                    limitsFrameRate ? "limited to 60 fps" : "passthrough",
+                    normalizeFrameRate ? "CFR normalized" : "passthrough",
                     outputLanes, hasAudio ? "enabled" : "not present", audioDecoderMode,
                     liveStream);
             long startPosition = nextVideoStartPosition();
@@ -963,6 +994,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         boolean needsScaling = outputDimensions.width != metadata.width
                 || outputDimensions.height != metadata.height;
         boolean limitsFrameRate = metadata.framesPerSecond > MAX_OUTPUT_FPS;
+        boolean normalizeFrameRate = liveStream || limitsFrameRate;
         VideoPixelFormat pixelFormat = activeVideoPixelFormat;
         int frameSize = Math.multiplyExact(
                 Math.multiplyExact(outputDimensions.width, outputDimensions.height),
@@ -999,6 +1031,13 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             command.add("auto");
         }
         addBufferedInputOptions(command);
+        addVideoCorruptionToleranceOptions(command);
+        if (liveStream) {
+            addLiveVideoInputOptions(command);
+        }
+        if (sharedAudioOutput != null && liveStream && LOW_LATENCY_LIVE_AUDIO) {
+            addLiveAudioInputOptions(command);
+        }
         addInputSeek(command, startPosition);
         command.add("-i");
         command.add(mediaUrl);
@@ -1014,12 +1053,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             videoFilters.add("hwdownload");
             videoFilters.add("format=nv12");
-            if (limitsFrameRate) {
+            if (normalizeFrameRate) {
                 videoFilters.add(String.format(Locale.ROOT, "fps=%.3f", outputFps));
             }
             videoFilters.add("format=" + pixelFormat.ffmpegName());
         } else {
-            if (limitsFrameRate) {
+            if (normalizeFrameRate) {
                 videoFilters.add(String.format(Locale.ROOT, "fps=%.3f", outputFps));
             }
             if (needsScaling && !disableScaling) {
@@ -1028,7 +1067,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         outputDimensions.height));
             }
         }
-        addVideoOutputs(command, videoFilters, outputDimensions, stripedOutput, pixelFormat);
+        addVideoOutputs(command, videoFilters, outputDimensions, stripedOutput, pixelFormat,
+                normalizeFrameRate);
         if (sharedAudioOutput != null) {
             addSharedAudioOutput(command, sharedAudioOutput);
         }
@@ -1121,7 +1161,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 decoder.pid(), sessionGeneration, mode.description, startPosition,
                 decoderStartPosition,
                 outputDimensions.width, outputDimensions.height, outputFps, frameSize,
-                needsScaling, limitsFrameRate,
+                needsScaling, normalizeFrameRate,
                 stripedOutput == null ? 1 : stripedOutput.laneCount(),
                 pixelFormat,
                 videoFilters.isEmpty() ? "none" : String.join(",", videoFilters),
@@ -1305,15 +1345,16 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     Main.LOGGER.debug("Video decode stats: pid={}, mode={}, frames={} ({} fps, "
                                     + "rawOutput={} MiB/s), totalFrames={}, media={} ms, clock={} ms, "
                                     + "drift={} ms, readAvg={} ms, readMax={} ms, pacing={} ms, "
-                                    + "firstByteAvg={} ms, readCalls={}, emptyPolls={}, "
-                                    + "bufferPending={}, submitted={}, replaced={}, taken={}",
+                        + "firstByteAvg={} ms, readCalls={}, emptyPolls={}, "
+                        + "bufferPending={}, queued={}, submitted={}, replaced={}, skipped={}, taken={}",
                             decoder.pid(), mode.description, statsDecodedFrames, decodeFps,
                             rawOutputMiB, decodedFrames, framePosition, clockPosition,
                             framePosition - clockPosition, averageReadMs,
                             statsMaximumReadNanos / 1_000_000.0D,
                             statsPacingNanos / 1_000_000.0D, averageFirstByteMs,
                             statsReadCalls, statsEmptyPolls, bufferStats.pendingFrame(),
-                            bufferStats.submittedFrames(), bufferStats.replacedFrames(),
+                            bufferStats.queuedFrames(), bufferStats.submittedFrames(),
+                            bufferStats.replacedFrames(), bufferStats.skippedFrames(),
                             bufferStats.takenFrames());
                     statsStartNanos = statsNow;
                     statsDecodedFrames = 0L;
@@ -1770,16 +1811,19 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static void addVideoOutputs(List<String> command, List<String> videoFilters,
                                         OutputDimensions output,
                                         StripedVideoOutput stripedOutput,
-                                        VideoPixelFormat pixelFormat) {
+                                        VideoPixelFormat pixelFormat,
+                                        boolean normalizeFrameRate) {
         if (stripedOutput == null) {
             if (!videoFilters.isEmpty()) {
                 command.add("-vf");
                 command.add(String.join(",", videoFilters));
             }
+            command.add("-map");
+            command.add("0:v:0");
             command.add("-pix_fmt");
             command.add(pixelFormat.ffmpegName());
-            command.add("-vsync");
-            command.add("0");
+            command.add("-fps_mode");
+            command.add(normalizeFrameRate ? "cfr" : "passthrough");
             command.add("-f");
             command.add("rawvideo");
             command.add("pipe:1");
@@ -1809,8 +1853,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             command.add("[video_pipe_output_" + stripe.index() + "]");
             command.add("-pix_fmt");
             command.add(pixelFormat.ffmpegName());
-            command.add("-vsync");
-            command.add("0");
+            command.add("-fps_mode");
+            command.add(normalizeFrameRate ? "cfr" : "passthrough");
             command.add("-flush_packets");
             command.add("1");
             command.add("-avioflags");
@@ -1829,10 +1873,14 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         command.add("-dn");
         command.add("-af");
         command.add("aresample=async=1:first_pts=0");
+        command.add("-c:a");
+        command.add("pcm_s16le");
         command.add("-ac");
         command.add(Integer.toString(AUDIO_CHANNELS));
         command.add("-ar");
         command.add(Integer.toString(AUDIO_SAMPLE_RATE));
+        command.add("-flush_packets");
+        command.add("1");
         command.add("-f");
         command.add("s16le");
         command.add(output.url());
@@ -1845,6 +1893,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         OutputDimensions output = outputDimensions(metadata.width, metadata.height, disableScaling);
         boolean needsScaling = output.width != metadata.width || output.height != metadata.height;
         boolean limitsFrameRate = metadata.framesPerSecond > MAX_OUTPUT_FPS;
+        boolean normalizeFrameRate = liveStream || limitsFrameRate;
         List<String> command = new ArrayList<>();
         command.add(ffmpegExecutable());
         command.add("-hide_banner");
@@ -1861,6 +1910,13 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             command.add("auto");
         }
         addBufferedInputOptions(command);
+        addVideoCorruptionToleranceOptions(command);
+        if (liveStream) {
+            addLiveVideoInputOptions(command);
+        }
+        if (shareAudioWithVideo && liveStream && LOW_LATENCY_LIVE_AUDIO) {
+            addLiveAudioInputOptions(command);
+        }
         addInputSeek(command, startPosition);
         command.add("-i");
         command.add(mediaUrl);
@@ -1875,12 +1931,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             }
             filters.add("hwdownload");
             filters.add("format=nv12");
-            if (limitsFrameRate) {
+            if (normalizeFrameRate) {
                 filters.add(String.format(Locale.ROOT, "fps=%.3f", outputFps));
             }
             filters.add("format=" + pixelFormat.ffmpegName());
         } else {
-            if (limitsFrameRate) {
+            if (normalizeFrameRate) {
                 filters.add(String.format(Locale.ROOT, "fps=%.3f", outputFps));
             }
             if (needsScaling && !disableScaling) {
@@ -1894,8 +1950,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         }
         command.add("-pix_fmt");
         command.add(pixelFormat.ffmpegName());
-        command.add("-vsync");
-        command.add("0");
+        command.add("-fps_mode");
+        command.add(normalizeFrameRate ? "cfr" : "passthrough");
         command.add("-f");
         command.add("rawvideo");
         command.add("pipe:1");
@@ -2030,6 +2086,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         command.add("-v");
         command.add("error");
         addNetworkInputOptions(command);
+        addVideoCorruptionToleranceOptions(command);
         command.add("-skip_estimate_duration_from_pts");
         command.add("1");
         command.add("-probesize");
@@ -2042,14 +2099,15 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         command.add("-of");
         command.add("json");
         command.add(mediaUrl);
-        Process probe = EmbeddedFfmpeg.processBuilder(command)
-                .redirectErrorStream(true).start();
+        Process probe = EmbeddedFfmpeg.processBuilder(command).start();
         Main.LOGGER.debug("Started {} ffprobe process: pid={}, generation={}",
                 fastProbe ? "fast" : "full", probe.pid(), sessionGeneration);
         if (!registerProcess(probe, sessionGeneration, false)) {
             terminateProcessTree(probe);
             throw new IOException("Video session was cancelled");
         }
+        FfmpegErrorCollector errors = new FfmpegErrorCollector(probe.getErrorStream());
+        errors.start();
         try {
             long waitStartNanos = System.nanoTime();
             long timeoutNanos = TimeUnit.SECONDS.toNanos(timeoutSeconds);
@@ -2078,9 +2136,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 probe.waitFor(1L, TimeUnit.SECONDS);
             }
             String probeOutput = new String(
-                    probe.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                    probe.getInputStream().readAllBytes(), StandardCharsets.UTF_8)
+                    .stripLeading();
+            errors.await();
+            String probeErrors = errors.text();
             if (probe.exitValue() != 0) {
-                int httpStatus = findHttpErrorStatus(probeOutput);
+                int httpStatus = findHttpErrorStatus(probeErrors + " " + probeOutput);
                 if (httpStatus >= 0) {
                     throw new HttpStatusException(httpStatus);
                 }
@@ -2098,6 +2159,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 if (fastProbe) {
                     throw new FastProbeException("ffprobe returned invalid metadata");
                 }
+                Main.LOGGER.debug("ffprobe returned invalid video metadata; stderr={}",
+                        summarizeFfmpegDiagnostics(probeErrors));
                 throw new MediaSourceException(
                         VideoPlaybackErrorMessage.Reason.VIDEO_UNPLAYABLE,
                         "ffprobe returned invalid video metadata");
@@ -2105,6 +2168,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         } finally {
             if (probe.isAlive()) {
                 terminateProcessTree(probe);
+            }
+            try {
+                errors.await();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
             }
             Main.LOGGER.debug("FFmpeg {} ffprobe finished: pid={}, generation={}, elapsed={} ms, "
                             + "state={}",
@@ -2163,12 +2231,13 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         command.add("-of");
         command.add("json");
         command.add(mediaUrl);
-        Process probe = EmbeddedFfmpeg.processBuilder(command)
-                .redirectErrorStream(true).start();
+        Process probe = EmbeddedFfmpeg.processBuilder(command).start();
         if (!registerProcess(probe, sessionGeneration, false)) {
             terminateProcessTree(probe);
             throw new IOException("Video session was cancelled");
         }
+        FfmpegErrorCollector errors = new FfmpegErrorCollector(probe.getErrorStream());
+        errors.start();
         try {
             long deadlineNanos = System.nanoTime()
                     + TimeUnit.SECONDS.toNanos(PROBE_TIMEOUT_SECONDS);
@@ -2182,9 +2251,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                 probe.waitFor(1L, TimeUnit.SECONDS);
             }
             String output = new String(probe.getInputStream().readAllBytes(),
-                    StandardCharsets.UTF_8);
+                    StandardCharsets.UTF_8).stripLeading();
+            errors.await();
+            String probeErrors = errors.text();
             if (probe.exitValue() != 0) {
-                int httpStatus = findHttpErrorStatus(output);
+                int httpStatus = findHttpErrorStatus(probeErrors + " " + output);
                 if (httpStatus >= 0) {
                     throw new HttpStatusException(httpStatus);
                 }
@@ -2212,6 +2283,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         } finally {
             if (probe.isAlive()) {
                 terminateProcessTree(probe);
+            }
+            try {
+                errors.await();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
             }
             Main.LOGGER.debug("FFmpeg audio ffprobe finished: pid={}, generation={}, elapsed={} ms, "
                             + "state={}",
@@ -2271,6 +2347,52 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
         addNetworkInputOptions(command);
         command.add("-thread_queue_size");
         command.add(Integer.toString(INPUT_THREAD_QUEUE_PACKETS));
+    }
+
+    /** Applies low-latency input flags only to live audio decoders. */
+    private static void addLiveAudioInputOptions(List<String> command) {
+        command.add("-fflags");
+        command.add("nobuffer");
+        command.add("-flags");
+        command.add("low_delay");
+        command.add("-analyzeduration");
+        command.add(Long.toString(LIVE_AUDIO_ANALYZE_DURATION_US));
+        command.add("-probesize");
+        command.add(Integer.toString(LIVE_AUDIO_PROBE_SIZE_BYTES));
+    }
+
+    private static void addLiveVideoInputOptions(List<String> command) {
+        addLiveInputTimingOptions(command);
+        if (!LOW_LATENCY_LIVE_VIDEO) {
+            return;
+        }
+        command.add("-fflags");
+        command.add(DISCARD_CORRUPT_PACKETS ? "nobuffer+discardcorrupt" : "nobuffer");
+        command.add("-flags");
+        command.add("low_delay");
+    }
+
+    private static void addLiveInputTimingOptions(List<String> command) {
+        command.add("-rtbufsize");
+        command.add(Integer.toString(LIVE_INPUT_RTBUF_SIZE_BYTES));
+        if (REALTIME_LIVE_INPUT) {
+            command.add("-re");
+        }
+        if (WALLCLOCK_LIVE_INPUT_TIMESTAMPS) {
+            command.add("-use_wallclock_as_timestamps");
+            command.add("1");
+        }
+    }
+
+    /** Applies damaged-packet tolerance only to video inputs; audio keeps its full packet cadence. */
+    private static void addVideoCorruptionToleranceOptions(List<String> command) {
+        if (!DISCARD_CORRUPT_PACKETS) {
+            return;
+        }
+        command.add("-fflags");
+        command.add("+discardcorrupt");
+        command.add("-err_detect");
+        command.add("ignore_err");
     }
 
     private void addInputSeek(List<String> command, long startPosition) {
@@ -2579,6 +2701,25 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static int positiveIntegerProperty(String name, int fallback) {
         int value = Integer.getInteger(name, fallback);
         return value > 0 ? value : fallback;
+    }
+
+    private static long positiveLongProperty(String name, long fallback) {
+        long value = Long.getLong(name, fallback);
+        return value > 0L ? value : fallback;
+    }
+
+    private static int audioSampleRateProperty() {
+        int value = Integer.getInteger("video_synchronizer.audioSampleRate", 48_000);
+        return value >= 8_000 && value <= 192_000 ? value : 48_000;
+    }
+
+    private static long nonNegativeLongProperty(String name, long fallback) {
+        try {
+            long value = Long.parseLong(System.getProperty(name, Long.toString(fallback)));
+            return value >= 0L ? value : fallback;
+        } catch (NumberFormatException ignored) {
+            return fallback;
+        }
     }
 
     private static double positiveDoubleProperty(String name, double fallback) {
@@ -3286,13 +3427,13 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                                      Process decoder, long startPositionMs,
                                      PreparedSharedAudio prepared) {
             SourceDataLine line = null;
-            AudioReadWatchdog watchdog = new AudioReadWatchdog(decoder, sessionGeneration);
+            AudioReadWatchdog writeWatchdog = new AudioReadWatchdog(decoder, sessionGeneration);
             boolean submittedAudio = false;
             long decodedFrames = 0L;
             long lineBasePositionMs = startPositionMs;
             long lineBaseFrame = 0L;
+            BufferedAudioInput bufferedInput = null;
             try {
-                InputStream output = input;
                 line = openAudioLine();
                 setActiveLine(line, sessionGeneration);
                 byte[] pcm = new byte[AUDIO_CHUNK_FRAMES * AUDIO_FRAME_SIZE];
@@ -3301,14 +3442,19 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     pcm = prepared.firstChunk();
                     preparedChunkBytes = prepared.firstChunkBytes();
                 }
-                int startupCarryBytes = 0;
                 long startupDrainedBytes = 0L;
                 boolean startupDrainLogged = false;
                 boolean lineRunning = false;
                 float appliedVolume = Float.NaN;
                 long nextVolumeUpdateNanos = 0L;
-                while (isActive(sessionGeneration) && decoder.isAlive()
+                byte[] queuedPcm = null;
+                bufferedInput = new BufferedAudioInput(input, decoder, sessionGeneration);
+                while (isActive(sessionGeneration)
                         && sharedInput == input) {
+                    if (queuedPcm != null) {
+                        bufferedInput.recycle(queuedPcm);
+                        queuedPcm = null;
+                    }
                     boolean waitingForVideoClock = !clockStarted;
                     if (!waitingForVideoClock && !startupDrainLogged) {
                         startupDrainLogged = true;
@@ -3332,51 +3478,37 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         submittedAudio = false;
                         audioEstablished = false;
                     }
-                    if (!waitingForVideoClock && startupCarryBytes > 0) {
-                        int read = output.read(pcm, startupCarryBytes,
-                                AUDIO_FRAME_SIZE - startupCarryBytes);
-                        if (read <= 0) {
-                            break;
-                        }
-                        startupCarryBytes += read;
-                        if (startupCarryBytes < AUDIO_FRAME_SIZE) {
-                            continue;
-                        }
-                        decodedFrames++;
-                        startupCarryBytes = 0;
-                        continue;
-                    }
                     int bytesRead;
                     if (waitingForVideoClock) {
-                        int read;
                         if (preparedChunkBytes > 0) {
-                            read = preparedChunkBytes;
+                            bytesRead = preparedChunkBytes;
                             preparedChunkBytes = 0;
                         } else {
-                            // FFmpeg may emit audio before the first video frame after an
-                            // arbitrary input seek. Drain partial output without waiting for a
-                            // complete PCM chunk so the shared socket cannot block video output.
-                            read = output.read(pcm, startupCarryBytes,
-                                    pcm.length - startupCarryBytes);
+                            AudioChunk queuedChunk = bufferedInput.take();
+                            if (queuedChunk == null) {
+                                break;
+                            }
+                            pcm = queuedChunk.data();
+                            queuedPcm = pcm;
+                            bytesRead = queuedChunk.length();
                         }
-                        if (read <= 0) {
+                        if (bytesRead <= 0) {
                             break;
                         }
-                        int totalBytes = startupCarryBytes + read;
-                        int alignedBytes = totalBytes - totalBytes % AUDIO_FRAME_SIZE;
-                        decodedFrames += alignedBytes / AUDIO_FRAME_SIZE;
-                        startupDrainedBytes += alignedBytes;
-                        startupCarryBytes = totalBytes - alignedBytes;
-                        if (startupCarryBytes > 0) {
-                            System.arraycopy(pcm, alignedBytes, pcm, 0, startupCarryBytes);
-                        }
+                        decodedFrames += bytesRead / AUDIO_FRAME_SIZE;
+                        startupDrainedBytes += bytesRead;
                         continue;
                     } else if (preparedChunkBytes > 0) {
                         bytesRead = preparedChunkBytes;
                         preparedChunkBytes = 0;
                     } else {
-                        bytesRead = readAudioChunk(output, pcm, sessionGeneration, watchdog,
-                                submittedAudio ? AUDIO_STALL_TIMEOUT_MS : AUDIO_START_TIMEOUT_MS);
+                        AudioChunk queuedChunk = bufferedInput.take();
+                        if (queuedChunk == null) {
+                            break;
+                        }
+                        pcm = queuedChunk.data();
+                        queuedPcm = pcm;
+                        bytesRead = queuedChunk.length();
                     }
                     if (bytesRead <= 0) {
                         break;
@@ -3429,7 +3561,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         nextVolumeUpdateNanos = now + TimeUnit.MILLISECONDS.toNanos(250L);
                     }
                     spatializeAudio(pcm, bytesRead);
-                    writeAudio(line, pcm, bytesRead, watchdog);
+                    writeAudio(line, pcm, bytesRead, writeWatchdog);
                     if (!submittedAudio) {
                         submittedAudio = true;
                         audioEstablished = true;
@@ -3463,7 +3595,10 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
             } finally {
-                watchdog.close();
+                writeWatchdog.close();
+                if (bufferedInput != null) {
+                    bufferedInput.close();
+                }
                 closeQuietly(input);
                 clearActiveLine(line);
                 closeAudioLine(line);
@@ -3708,10 +3843,17 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             long statsChunks = 0L;
             long statsDiscardedChunks = 0L;
             String processErrors = "";
-            AudioReadWatchdog readWatchdog = new AudioReadWatchdog(decoder, sessionGeneration);
+            AudioReadWatchdog writeWatchdog = new AudioReadWatchdog(decoder, sessionGeneration);
             setActiveLine(line, sessionGeneration);
-            try (InputStream output = decoderOutput) {
+            byte[] queuedPcm = null;
+            try (InputStream output = decoderOutput;
+                 BufferedAudioInput bufferedInput = new BufferedAudioInput(
+                         output, decoder, sessionGeneration)) {
                 while (isActive(sessionGeneration)) {
+                    if (queuedPcm != null) {
+                        bufferedInput.recycle(queuedPcm);
+                        queuedPcm = null;
+                    }
                     if (audioRequestedSeekMs.get() >= 0L) {
                         return AudioDecodeResult.SEEK_REQUESTED;
                     }
@@ -3744,8 +3886,17 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         bytesRead = preparedChunkBytes;
                         preparedChunkBytes = 0;
                     } else {
-                        bytesRead = readAudioChunk(output, pcm, sessionGeneration, readWatchdog,
-                                submittedAudio ? AUDIO_STALL_TIMEOUT_MS : AUDIO_START_TIMEOUT_MS);
+                        AudioChunk queuedChunk = bufferedInput.take();
+                        if (queuedChunk == null) {
+                            if (audioRequestedSeekMs.get() >= 0L) {
+                                return AudioDecodeResult.SEEK_REQUESTED;
+                            }
+                            bytesRead = bufferedInput.terminalResult;
+                        } else {
+                            pcm = queuedChunk.data();
+                            queuedPcm = pcm;
+                            bytesRead = queuedChunk.length();
+                        }
                     }
                     if (bytesRead == AUDIO_READ_CANCELLED
                             || audioRequestedSeekMs.get() >= 0L) {
@@ -3825,7 +3976,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         nextVolumeUpdateNanos = now + TimeUnit.MILLISECONDS.toNanos(250L);
                     }
                     spatializeAudio(pcm, bytesRead);
-                    writeAudio(line, pcm, bytesRead, readWatchdog);
+                    writeAudio(line, pcm, bytesRead, writeWatchdog);
                     boolean recovered = reconnecting;
                     reconnecting = false;
                     if (!submittedAudio) {
@@ -3869,7 +4020,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     line.drain();
                 }
             } finally {
-                readWatchdog.close();
+                writeWatchdog.close();
                 clearActiveLine(line);
                 closeAudioLine(line);
                 terminateProcessTree(decoder);
@@ -3946,6 +4097,123 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             } finally {
                 watchdog.end();
             }
+        }
+
+        /** Reads PCM ahead of the device writer so a short device stall cannot back up FFmpeg. */
+        private final class BufferedAudioInput implements AutoCloseable {
+            private final InputStream input;
+            private final Process decoder;
+            private final long sessionGeneration;
+            private final ArrayBlockingQueue<AudioChunk> queue =
+                    new ArrayBlockingQueue<>(AUDIO_PCM_QUEUE_CHUNKS);
+            private final ArrayBlockingQueue<byte[]> recycled =
+                    new ArrayBlockingQueue<>(AUDIO_PCM_QUEUE_CHUNKS + 2);
+            private final AtomicBoolean closed = new AtomicBoolean();
+            private volatile boolean finished;
+            private volatile IOException failure;
+            private volatile int terminalResult;
+            private final Thread reader;
+
+            private BufferedAudioInput(InputStream input, Process decoder,
+                                       long sessionGeneration) {
+                this.input = input;
+                this.decoder = decoder;
+                this.sessionGeneration = sessionGeneration;
+                reader = new Thread(this::readLoop, "VideoSynchronizer-PCM-Reader");
+                reader.setDaemon(true);
+                reader.start();
+            }
+
+            private void readLoop() {
+                AudioReadWatchdog watchdog = new AudioReadWatchdog(decoder, sessionGeneration);
+                try {
+                    while (!closed.get() && isActive(sessionGeneration)
+                            && audioRequestedSeekMs.get() < 0L) {
+                        byte[] pcm = recycled.poll();
+                        if (pcm == null) {
+                            pcm = new byte[AUDIO_CHUNK_FRAMES * AUDIO_FRAME_SIZE];
+                        }
+                        int bytesRead = readAudioChunk(input, pcm, sessionGeneration, watchdog,
+                                audioEstablished ? AUDIO_INPUT_STALL_TIMEOUT_MS
+                                        : AUDIO_START_TIMEOUT_MS);
+                        if (bytesRead == AUDIO_READ_CANCELLED
+                                || audioRequestedSeekMs.get() >= 0L || !isActive(sessionGeneration)) {
+                            recycle(pcm);
+                            terminalResult = AUDIO_READ_CANCELLED;
+                            break;
+                        }
+                        if (bytesRead == AUDIO_READ_STALLED) {
+                            recycle(pcm);
+                            terminalResult = AUDIO_READ_STALLED;
+                            break;
+                        }
+                        if (bytesRead <= 0) {
+                            recycle(pcm);
+                            terminalResult = bytesRead;
+                            break;
+                        }
+                        bytesRead -= bytesRead % AUDIO_FRAME_SIZE;
+                        if (bytesRead == 0) {
+                            recycle(pcm);
+                            continue;
+                        }
+                        queue.put(new AudioChunk(pcm, bytesRead));
+                    }
+                } catch (IOException exception) {
+                    failure = exception;
+                    terminalResult = AUDIO_READ_STALLED;
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    terminalResult = AUDIO_READ_CANCELLED;
+                } finally {
+                    finished = true;
+                    watchdog.close();
+                }
+            }
+
+            private AudioChunk take() throws IOException, InterruptedException {
+                while (!closed.get()) {
+                    AudioChunk chunk = queue.poll(100L, TimeUnit.MILLISECONDS);
+                    if (chunk != null) {
+                        return chunk;
+                    }
+                    if (finished) {
+                        if (failure != null) {
+                            throw failure;
+                        }
+                        return null;
+                    }
+                    if (!isActive(sessionGeneration) || audioRequestedSeekMs.get() >= 0L) {
+                        return null;
+                    }
+                }
+                return null;
+            }
+
+            private void recycle(byte[] pcm) {
+                if (pcm != null && !recycled.offer(pcm)) {
+                    // The array is intentionally left for GC when the bounded pool is full.
+                }
+            }
+
+            @Override
+            public void close() {
+                if (!closed.compareAndSet(false, true)) {
+                    return;
+                }
+                closeQuietly(input);
+                reader.interrupt();
+                try {
+                    reader.join(1_000L);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                }
+                queue.forEach(chunk -> recycle(chunk.data()));
+                queue.clear();
+            }
+        }
+
+        private record AudioChunk(byte[] data, int length) {
         }
 
         private final class AudioReadWatchdog implements AutoCloseable {
@@ -4167,6 +4435,12 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             command.add("error");
             command.add("-nostdin");
             addBufferedInputOptions(command);
+            if (liveStream) {
+                addLiveInputTimingOptions(command);
+            }
+            if (liveStream && LOW_LATENCY_LIVE_AUDIO) {
+                addLiveAudioInputOptions(command);
+            }
             addInputSeek(command, startPosition);
             command.add("-i");
             command.add(sessionUrl);
@@ -4177,10 +4451,14 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             command.add("-dn");
             command.add("-af");
             command.add("aresample=async=1:first_pts=0");
+            command.add("-c:a");
+            command.add("pcm_s16le");
             command.add("-ac");
             command.add(Integer.toString(AUDIO_CHANNELS));
             command.add("-ar");
             command.add(Integer.toString(AUDIO_SAMPLE_RATE));
+            command.add("-flush_packets");
+            command.add("1");
             command.add("-f");
             command.add("s16le");
             command.add("pipe:1");

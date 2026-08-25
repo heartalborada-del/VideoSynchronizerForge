@@ -371,6 +371,16 @@ public final class ClientVideoState {
         }
     }
 
+    /** Returns the local monotonic render clock, or -1 until the first frame starts it. */
+    public static long renderPositionMs(String sessionId) {
+        SessionState session = SESSIONS.get(sessionId);
+        if (session == null || session.adapter == null
+                || !session.adapter.isPlaybackClockStarted()) {
+            return -1L;
+        }
+        return session.adapter.positionMs();
+    }
+
     public static void requestResync() {
         SESSIONS.keySet().forEach(sessionId ->
                 VideoNetwork.CHANNEL.sendToServer(new VideoResyncMessage(sessionId)));

@@ -93,7 +93,8 @@ public final class ScreenTexture {
         if (statsStartNanos != 0L) {
             statsRenderTicks++;
         }
-        VideoFrameBuffer.DecodedFrame frame = frameBuffer.take();
+        long renderPositionMs = ClientVideoState.renderPositionMs(sessionId);
+        VideoFrameBuffer.DecodedFrame frame = frameBuffer.takeForPosition(renderPositionMs);
         if (frame != null) {
             long uploadStart = System.nanoTime();
             upload(frame);
@@ -318,7 +319,8 @@ public final class ScreenTexture {
                             + "replaced=+{} (total {}), taken=+{} (total {}), "
                             + "allocated=+{} (total {}), reused=+{} (total {}), "
                             + "released=+{} (total {}), discarded=+{} (total {}), "
-                            + "cleared=+{} (total {}), pending={}, pooled={}",
+                            + "skipped=+{} (total {}), cleared=+{} (total {}), "
+                            + "pending={}, queued={}, pooled={}",
                     bufferStats.submittedFrames() - previousBufferStats.submittedFrames(),
                     bufferStats.submittedFrames(),
                     bufferStats.replacedFrames() - previousBufferStats.replacedFrames(),
@@ -333,8 +335,11 @@ public final class ScreenTexture {
                     bufferStats.releasedFrames(),
                     bufferStats.discardedArrays() - previousBufferStats.discardedArrays(),
                     bufferStats.discardedArrays(),
+                    bufferStats.skippedFrames() - previousBufferStats.skippedFrames(),
+                    bufferStats.skippedFrames(),
                     bufferStats.clearedFrames() - previousBufferStats.clearedFrames(),
                     bufferStats.clearedFrames(), bufferStats.pendingFrame(),
+                    bufferStats.queuedFrames(),
                     bufferStats.pooledArrays());
         }
         resetDebugInterval(now, bufferStats);
