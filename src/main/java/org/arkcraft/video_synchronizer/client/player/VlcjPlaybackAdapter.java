@@ -432,6 +432,11 @@ public final class VlcjPlaybackAdapter implements ClientVideoState.PlaybackAdapt
             }
             return anchorPositionMs;
         }
+        if (waitingForClients) {
+            // LibVLC keeps decoding during the readiness barrier, but that time is
+            // preload and must not advance the server-authoritative playback clock.
+            return anchorPositionMs;
+        }
         long time = estimatedNativePositionMs(System.nanoTime());
         if (time >= 0L) {
             return durationMs > 0L ? Math.min(durationMs, time) : time;
@@ -713,8 +718,16 @@ public final class VlcjPlaybackAdapter implements ClientVideoState.PlaybackAdapt
 
     private long nextFramePositionMs() {
         long now = System.nanoTime();
-        long candidate = liveStream
-                ? livePositionAt(now) : estimatedNativePositionMs(now);
+        long candidate;
+        if (!liveStream && waitingForClients) {
+            // Keep frames decoded during preload on the same timeline as the
+            // authoritative target so the first frame can establish readiness
+            // without importing LibVLC's buffering delay into playback time.
+            candidate = anchorPositionMs;
+        } else {
+            candidate = liveStream
+                    ? livePositionAt(now) : estimatedNativePositionMs(now);
+        }
         if (candidate < 0L) {
             candidate = 0L;
         }

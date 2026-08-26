@@ -96,12 +96,15 @@ public final class ScreenCreator {
         Direction actualScreenUp = level.getBlockState(first).getValue(ScreenBlock.SCREEN_UP);
         Direction secondActualFacing = level.getBlockState(second).getValue(ScreenBlock.FACING);
         Direction secondActualScreenUp = level.getBlockState(second).getValue(ScreenBlock.SCREEN_UP);
-        if (facing != secondFacing || facing != actualFacing
-                || actualFacing != secondActualFacing || screenUp != actualScreenUp
-                || actualScreenUp != secondActualScreenUp) {
+        ScreenOrientation expectedOrientation = ScreenOrientation.of(facing, screenUp);
+        if (!expectedOrientation.equals(ScreenOrientation.of(actualFacing, actualScreenUp))
+                || !expectedOrientation.equals(ScreenOrientation.of(secondFacing,
+                secondActualScreenUp))
+                || !expectedOrientation.equals(ScreenOrientation.of(secondActualFacing,
+                secondActualScreenUp))) {
             throw new SelectionException("message.video_synchronizer.selection_tool.face");
         }
-        ScreenOrientation orientation = ScreenOrientation.of(facing, screenUp);
+        ScreenOrientation orientation = expectedOrientation;
         int dx = second.getX() - first.getX();
         int dy = second.getY() - first.getY();
         int dz = second.getZ() - first.getZ();

@@ -13,6 +13,7 @@ import net.minecraftforge.network.PacketDistributor;
 import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenScreenBindingMessage;
 import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenPlaybackConsentMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
+import org.arkcraft.video_synchronizer.item.ScreenSelectionToolItem;
 import org.arkcraft.video_synchronizer.server.ServerScreenRegistry;
 import org.arkcraft.video_synchronizer.server.VideoPermissionService;
 import net.minecraft.world.level.block.BaseEntityBlock;
@@ -77,6 +78,9 @@ public final class ScreenBlock extends BaseEntityBlock {
     @Override
     public InteractionResult use(BlockState state, Level level, BlockPos pos, Player player,
                                  InteractionHand hand, BlockHitResult hit) {
+        if (player.getItemInHand(hand).getItem() instanceof ScreenSelectionToolItem) {
+            return InteractionResult.PASS;
+        }
         if (!level.isClientSide && player instanceof ServerPlayer serverPlayer
                 && level.getBlockEntity(pos) instanceof ScreenBlockEntity screen) {
             String screenId = ServerScreenRegistry.screenId(serverPlayer.serverLevel(), screen);

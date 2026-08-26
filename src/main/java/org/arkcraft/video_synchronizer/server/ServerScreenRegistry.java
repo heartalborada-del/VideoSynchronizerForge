@@ -381,12 +381,13 @@ public final class ServerScreenRegistry {
                         "message.video_synchronizer.error.second_not_panel"));
         Direction facing = firstPanel.getBlockState().getValue(ScreenBlock.FACING);
         Direction screenUp = firstPanel.getBlockState().getValue(ScreenBlock.SCREEN_UP);
-        if (facing != secondPanel.getBlockState().getValue(ScreenBlock.FACING)
-                || screenUp != secondPanel.getBlockState().getValue(ScreenBlock.SCREEN_UP)) {
+        ScreenOrientation orientation = ScreenOrientation.of(facing, screenUp);
+        if (!orientation.equals(ScreenOrientation.of(
+                secondPanel.getBlockState().getValue(ScreenBlock.FACING),
+                secondPanel.getBlockState().getValue(ScreenBlock.SCREEN_UP)))) {
             throw new LocalizedArgumentException(
                     "message.video_synchronizer.error.selection_orientation");
         }
-        ScreenOrientation orientation = ScreenOrientation.of(facing, screenUp);
         int dx = second.getX() - first.getX();
         int dy = second.getY() - first.getY();
         int dz = second.getZ() - first.getZ();
@@ -417,10 +418,9 @@ public final class ServerScreenRegistry {
                 BlockPos pos = geometry.origin.relative(orientation.right(), column)
                         .relative(orientation.up(), row);
                 ScreenBlockEntity panel = getScreen(level, pos).orElse(null);
-                if (panel == null || panel.getBlockState().getValue(ScreenBlock.FACING)
-                        != geometry.facing
-                        || panel.getBlockState().getValue(ScreenBlock.SCREEN_UP)
-                        != geometry.screenUp) {
+                if (panel == null || !orientation.equals(ScreenOrientation.of(
+                        panel.getBlockState().getValue(ScreenBlock.FACING),
+                        panel.getBlockState().getValue(ScreenBlock.SCREEN_UP)))) {
                     if (requireComplete) {
                         throw new LocalizedArgumentException(
                                 "message.video_synchronizer.error.selection_missing_panel",
