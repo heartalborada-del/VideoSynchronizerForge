@@ -3,6 +3,7 @@ package org.arkcraft.video_synchronizer.network.packet.clientbound;
 import org.arkcraft.video_synchronizer.network.model.AudioPlaybackMode;
 import org.arkcraft.video_synchronizer.network.model.MediaRequestOptions;
 import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.model.VideoBackend;
 
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraftforge.network.NetworkEvent;
@@ -12,8 +13,9 @@ import java.util.function.Supplier;
 
 public record VideoStartMessage(String sessionId, String videoId, String videoUrl, String audioUrl,
                                 String requestHeaders, String cookie, boolean disableScaling,
-                                int videoPipeLanes, VideoPixelFormat videoPixelFormat,
-                                double audioRange, AudioPlaybackMode audioPlaybackMode,
+                                 int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                                 VideoBackend videoBackend,
+                                 double audioRange, AudioPlaybackMode audioPlaybackMode,
                                 long durationMs, boolean live,
                                 long positionMs, boolean playing,
                                 boolean waitingForClients, long revision,
@@ -21,11 +23,12 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
     public VideoStartMessage(String sessionId, String videoId, String videoUrl, String audioUrl,
                              String requestHeaders, String cookie, boolean disableScaling,
                              int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                             VideoBackend videoBackend,
                              double audioRange, AudioPlaybackMode audioPlaybackMode,
                              long durationMs, boolean live, long positionMs, boolean playing,
                              boolean waitingForClients, long revision, long sentAtNanos) {
         this(sessionId, videoId, videoUrl, audioUrl, requestHeaders, cookie, disableScaling,
-                videoPipeLanes, videoPixelFormat, audioRange, audioPlaybackMode,
+                videoPipeLanes, videoPixelFormat, videoBackend, audioRange, audioPlaybackMode,
                 durationMs, live, positionMs, playing,
                 waitingForClients, revision, sentAtNanos, 0L);
     }
@@ -40,6 +43,7 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
         buf.writeBoolean(disableScaling);
         buf.writeVarInt(videoPipeLanes);
         buf.writeEnum(videoPixelFormat);
+        buf.writeEnum(videoBackend);
         buf.writeDouble(audioRange);
         buf.writeEnum(audioPlaybackMode);
         buf.writeLong(durationMs);
@@ -57,6 +61,7 @@ public record VideoStartMessage(String sessionId, String videoId, String videoUr
                 buf.readUtf(MediaRequestOptions.MAX_COOKIE_LENGTH), buf.readBoolean(),
                 buf.readVarInt(),
                 buf.readEnum(VideoPixelFormat.class),
+                buf.readEnum(VideoBackend.class),
                 buf.readDouble(),
                 buf.readEnum(AudioPlaybackMode.class),
                 buf.readLong(),

@@ -10,8 +10,9 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class VideoFrameBuffer {
     private static final int DEFAULT_QUEUE_CAPACITY = 8;
     private static final long FRAME_SELECTION_LEAD_MS = 75L;
+    private static final long MAX_REORDER_MS = 250L;
     private final int capacity;
-    private final Queue<DecodedFrame> frames;
+    private final ArrayDeque<DecodedFrame> frames;
     private final Queue<byte[]> pool = new ArrayDeque<>();
     private final AtomicLong allocatedArrays = new AtomicLong();
     private final AtomicLong reusedArrays = new AtomicLong();
@@ -43,6 +44,19 @@ public final class VideoFrameBuffer {
 
     public synchronized void submit(DecodedFrame frame) {
         submittedFrames.incrementAndGet();
+        DecodedFrame newestQueued = frames.peekLast();
+        if (newestQueued != null && newestQueued.positionMs() >= 0L
+                && frame.positionMs() >= 0L
+                && frame.positionMs() + MAX_REORDER_MS < newestQueued.positionMs()) {
+            // A native status reset or a decoder replacement can put a stale frame
+            // behind newer frames. Keep the queue timestamp-ordered so rendering
+            // cannot wait forever for a position that will never be reached.
+            while (!frames.isEmpty()) {
+                DecodedFrame stale = frames.remove();
+                clearedFrames.incrementAndGet();
+                release(stale);
+            }
+        }
         if (frames.size() >= capacity) {
             DecodedFrame replaced = frames.remove();
             replacedFrames.incrementAndGet();
@@ -89,9 +103,16 @@ public final class VideoFrameBuffer {
         if (frame == null) {
             return;
         }
+        release(frame.data());
+    }
+
+    public synchronized void release(byte[] data) {
+        if (data == null) {
+            return;
+        }
         releasedFrames.incrementAndGet();
         if (pool.size() < capacity) {
-            pool.offer(frame.data());
+            pool.offer(data);
         } else {
             discardedArrays.incrementAndGet();
         }

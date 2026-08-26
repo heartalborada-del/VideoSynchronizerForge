@@ -26,6 +26,7 @@ import org.arkcraft.video_synchronizer.network.packet.clientbound.OpenPlaybackCo
 import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoLocalPauseMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.model.VideoBackend;
 import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoPlaybackErrorMessage;
 import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoPlaybackNoticeMessage;
 import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoProgressMessage;
@@ -66,6 +67,8 @@ public final class ServerVideoSessionManager {
 
     private static final Map<String, Session> SESSIONS = new HashMap<>();
     private static final Set<UUID> PLAYBACK_CAPABLE_PLAYERS = new HashSet<>();
+    private static final Set<UUID> FFMPEG_CAPABLE_PLAYERS = new HashSet<>();
+    private static final Set<UUID> VLCJ_CAPABLE_PLAYERS = new HashSet<>();
     private static final Map<UUID, Double> PLAYER_WEIGHTS = new HashMap<>();
     private static final Map<UUID, ServerBossEvent> STATUS_BOSS_BARS = new HashMap<>();
     private static Target pendingDefaultTarget;
@@ -88,14 +91,16 @@ public final class ServerVideoSessionManager {
         }
         startValidated(server, DEFAULT_SESSION_KEY, videoId, url, "",
                 MediaRequestOptions.EMPTY, false, 0, VideoPixelFormat.RGB24,
-                VideoManagerBlockEntity.DEFAULT_AUDIO_RANGE, AudioPlaybackMode.POSITIONAL,
+                VideoBackend.FFMPEG, VideoManagerBlockEntity.DEFAULT_AUDIO_RANGE,
+                AudioPlaybackMode.POSITIONAL,
                 pendingDefaultTarget, initiatedBy, initiatedById, DEFAULT_SESSION_KEY);
     }
 
     public static void startForScreen(MinecraftServer server, String requestedScreenId,
                                       String videoUrl, String audioUrl, String requestHeaders,
                                       String cookie, boolean disableScaling, int videoPipeLanes,
-                                      VideoPixelFormat videoPixelFormat, double audioRange,
+                                       VideoPixelFormat videoPixelFormat, VideoBackend videoBackend,
+                                       double audioRange,
                                       AudioPlaybackMode audioPlaybackMode,
                                       String initiatedBy, UUID initiatedById) {
         String screenId = ServerScreenRegistry.normalizeId(requestedScreenId);
@@ -115,7 +120,7 @@ public final class ServerVideoSessionManager {
         Target target = target(level, reference.pos(), screenId);
         startValidated(server, screenId, screenId, videoUrl, audioUrl,
                 new MediaRequestOptions(requestHeaders, cookie), disableScaling,
-                videoPipeLanes, videoPixelFormat, validateAudioRange(audioRange),
+                videoPipeLanes, videoPixelFormat, videoBackend, validateAudioRange(audioRange),
                 requireAudioPlaybackMode(audioPlaybackMode), target, initiatedBy,
                 initiatedById, replacingSessionKey);
     }
@@ -123,8 +128,9 @@ public final class ServerVideoSessionManager {
     private static void startValidated(MinecraftServer server, String key, String videoId,
                                        String videoUrl, String audioUrl,
                                        MediaRequestOptions options, boolean disableScaling,
-                                       int videoPipeLanes, VideoPixelFormat pixelFormat,
-                                       double audioRange, AudioPlaybackMode audioPlaybackMode,
+                                        int videoPipeLanes, VideoPixelFormat pixelFormat,
+                                        VideoBackend videoBackend,
+                                        double audioRange, AudioPlaybackMode audioPlaybackMode,
                                        Target target, String initiatedBy, UUID initiatedById,
                                        String replacingSessionKey) {
         if (initiatedById != null) {
@@ -141,6 +147,7 @@ public final class ServerVideoSessionManager {
                 videoUrl, audioUrl, normalizeInitiator(initiatedBy), initiatedById,
                 options, disableScaling, videoPipeLanes,
                 pixelFormat == null ? VideoPixelFormat.RGB24 : pixelFormat,
+                videoBackend == null ? VideoBackend.FFMPEG : videoBackend,
                 audioRange, audioPlaybackMode,
                 false, false, true, 1L, System.nanoTime(), target);
         refreshPlaybackConsents(server, session);
@@ -299,13 +306,15 @@ public final class ServerVideoSessionManager {
         Session session = findSession(screenId);
         if (session == null) {
             return new ControlState(false, "", "", "", "", false, 0,
-                    VideoPixelFormat.RGB24, VideoManagerBlockEntity.DEFAULT_AUDIO_RANGE,
+                    VideoPixelFormat.RGB24, VideoBackend.FFMPEG,
+                    VideoManagerBlockEntity.DEFAULT_AUDIO_RANGE,
                     AudioPlaybackMode.POSITIONAL,
                     0L, 0L, false, false, false);
         }
         return new ControlState(true, session.videoUrl, session.audioUrl,
                 session.requestOptions.headers(), session.requestOptions.cookie(),
                 session.disableScaling, session.videoPipeLanes, session.videoPixelFormat,
+                session.videoBackend,
                 session.audioRange, session.audioPlaybackMode,
                 positionAt(session, System.nanoTime()), session.durationMs,
                 session.live, session.playing, session.waitingForClients);
@@ -425,12 +434,22 @@ public final class ServerVideoSessionManager {
     }
 
     public static void acceptClientCapability(MinecraftServer server, ServerPlayer player,
-                                              boolean available) {
+                                              boolean ffmpegAvailable, boolean vlcjAvailable) {
         UUID playerId = player.getUUID();
-        if (available) {
+        if (ffmpegAvailable || vlcjAvailable) {
             PLAYBACK_CAPABLE_PLAYERS.add(playerId);
         } else {
             PLAYBACK_CAPABLE_PLAYERS.remove(playerId);
+        }
+        if (ffmpegAvailable) {
+            FFMPEG_CAPABLE_PLAYERS.add(playerId);
+        } else {
+            FFMPEG_CAPABLE_PLAYERS.remove(playerId);
+        }
+        if (vlcjAvailable) {
+            VLCJ_CAPABLE_PLAYERS.add(playerId);
+        } else {
+            VLCJ_CAPABLE_PLAYERS.remove(playerId);
         }
         for (Session session : SESSIONS.values()) {
             session.reports.remove(playerId);
@@ -440,7 +459,8 @@ public final class ServerVideoSessionManager {
             refreshEligiblePlayers(server, session);
             if (session.waitingForClients) {
                 tryBeginPlayback(server, session);
-            } else if (available && session.eligiblePlayers.contains(playerId)) {
+            } else if (hasBackendCapability(playerId, session.videoBackend)
+                    && session.eligiblePlayers.contains(playerId)) {
                 session.joinConfirmations.put(playerId, 0);
             }
         }
@@ -469,7 +489,7 @@ public final class ServerVideoSessionManager {
     public static void acceptPlaybackError(MinecraftServer server, ServerPlayer player,
                                            VideoPlaybackErrorMessage message) {
         Session session = sessionById(message.sessionId());
-        if (session == null || !PLAYBACK_CAPABLE_PLAYERS.contains(player.getUUID())
+        if (session == null || !hasBackendCapability(player.getUUID(), session.videoBackend)
                 || !isEligibleForSession(player, session)) {
             return;
         }
@@ -548,6 +568,8 @@ public final class ServerVideoSessionManager {
 
     public static void playerDisconnected(UUID playerId) {
         PLAYBACK_CAPABLE_PLAYERS.remove(playerId);
+        FFMPEG_CAPABLE_PLAYERS.remove(playerId);
+        VLCJ_CAPABLE_PLAYERS.remove(playerId);
         for (Session session : SESSIONS.values()) {
             session.reports.remove(playerId);
             session.readyDurations.remove(playerId);
@@ -628,6 +650,8 @@ public final class ServerVideoSessionManager {
     public static void reset() {
         SESSIONS.clear();
         PLAYBACK_CAPABLE_PLAYERS.clear();
+        FFMPEG_CAPABLE_PLAYERS.clear();
+        VLCJ_CAPABLE_PLAYERS.clear();
         PLAYER_WEIGHTS.clear();
         STATUS_BOSS_BARS.values().forEach(ServerBossEvent::removeAllPlayers);
         STATUS_BOSS_BARS.clear();
@@ -701,7 +725,7 @@ public final class ServerVideoSessionManager {
                 } else if (!isEligibleForSession(viewer, session)) {
                     localReadiness = Component.translatable(
                             "command.video_synchronizer.status.unloaded");
-                } else if (!PLAYBACK_CAPABLE_PLAYERS.contains(viewer.getUUID())) {
+                } else if (!hasBackendCapability(viewer.getUUID(), session.videoBackend)) {
                     localReadiness = Component.translatable(
                             "command.video_synchronizer.status.unavailable");
                 } else {
@@ -724,7 +748,7 @@ public final class ServerVideoSessionManager {
                         .withStyle(ChatFormatting.GRAY));
                 continue;
             }
-            if (!PLAYBACK_CAPABLE_PLAYERS.contains(viewer.getUUID())) {
+            if (!hasBackendCapability(viewer.getUUID(), session.videoBackend)) {
                 result = result.copy().append("\n").append(Component.translatable(
                         "command.video_synchronizer.status.local_unavailable")
                         .withStyle(ChatFormatting.RED));
@@ -775,7 +799,7 @@ public final class ServerVideoSessionManager {
                 bossBar.setProgress(0.0F);
                 return;
             }
-            if (!PLAYBACK_CAPABLE_PLAYERS.contains(playerId)) {
+            if (!hasBackendCapability(playerId, session.videoBackend)) {
                 bossBar.setName(Component.translatable(
                         "command.video_synchronizer.bossbar.unavailable"));
                 bossBar.setColor(BossEvent.BossBarColor.RED);
@@ -876,8 +900,12 @@ public final class ServerVideoSessionManager {
         if (!session.waitingForClients) {
             return false;
         }
+        long liveReports = session.readyLiveStreams.values().stream()
+                .filter(Boolean::booleanValue).count();
         int required = requiredReadyCount(session.eligiblePlayers.size());
-        if (session.readyDurations.size() < required) {
+        // A live source has no shared media position. Start it as soon as one
+        // client has locally verified the stream instead of waiting for peers.
+        if (liveReports == 0L && session.readyDurations.size() < required) {
             return false;
         }
         List<Long> durations = session.readyDurations.values().stream()
@@ -887,8 +915,6 @@ public final class ServerVideoSessionManager {
         if (medianDuration > 0L) {
             session.durationMs = medianDuration;
         }
-        long liveReports = session.readyLiveStreams.values().stream()
-                .filter(Boolean::booleanValue).count();
         session.live = liveReports > 0L;
         if (session.live) {
             session.durationMs = 0L;
@@ -971,6 +997,7 @@ public final class ServerVideoSessionManager {
         return new VideoStartMessage(session.sessionId, session.videoId, session.videoUrl,
                 session.audioUrl, session.requestOptions.headers(), session.requestOptions.cookie(),
                 session.disableScaling, session.videoPipeLanes, session.videoPixelFormat,
+                session.videoBackend,
                 session.audioRange, session.audioPlaybackMode,
                 session.durationMs, session.live, positionAt(session, nowNanos), session.playing,
                 session.waitingForClients, session.revision, nowNanos);
@@ -1158,6 +1185,9 @@ public final class ServerVideoSessionManager {
     }
 
     private static boolean isEligibleForSession(ServerPlayer player, Session session) {
+        if (!hasBackendCapability(player.getUUID(), session.videoBackend)) {
+            return false;
+        }
         if (!canReceivePlayback(session, player.getUUID())) {
             return false;
         }
@@ -1172,6 +1202,12 @@ public final class ServerVideoSessionManager {
         Vec3 source = session.target.sourcePosition();
         return source.distanceToSqr(player.getEyePosition())
                 < session.audioRange * session.audioRange;
+    }
+
+    private static boolean hasBackendCapability(UUID playerId, VideoBackend backend) {
+        return backend == VideoBackend.VLCJ
+                ? VLCJ_CAPABLE_PLAYERS.contains(playerId)
+                : FFMPEG_CAPABLE_PLAYERS.contains(playerId);
     }
 
     private static long positionAt(Session session, long nowNanos) {
@@ -1340,6 +1376,7 @@ public final class ServerVideoSessionManager {
     public record ControlState(boolean active, String videoUrl, String audioUrl,
                                String requestHeaders, String cookie, boolean disableScaling,
                                int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                               VideoBackend videoBackend,
                                double audioRange, AudioPlaybackMode audioPlaybackMode,
                                long positionMs, long durationMs, boolean live, boolean playing,
                                boolean waitingForClients) {
@@ -1357,6 +1394,7 @@ public final class ServerVideoSessionManager {
         private final boolean disableScaling;
         private final int videoPipeLanes;
         private final VideoPixelFormat videoPixelFormat;
+        private final VideoBackend videoBackend;
         private final double audioRange;
         private final AudioPlaybackMode audioPlaybackMode;
         private long durationMs;
@@ -1382,6 +1420,7 @@ public final class ServerVideoSessionManager {
                         String videoUrl, String audioUrl, String initiatedBy, UUID initiatedById,
                         MediaRequestOptions requestOptions, boolean disableScaling,
                         int videoPipeLanes, VideoPixelFormat videoPixelFormat,
+                        VideoBackend videoBackend,
                         double audioRange, AudioPlaybackMode audioPlaybackMode,
                         boolean playing, boolean waitingForClients, boolean playWhenReady,
                         long revision, long positionNanos, Target target) {
@@ -1396,6 +1435,7 @@ public final class ServerVideoSessionManager {
             this.disableScaling = disableScaling;
             this.videoPipeLanes = videoPipeLanes;
             this.videoPixelFormat = videoPixelFormat;
+            this.videoBackend = videoBackend;
             this.audioRange = audioRange;
             this.audioPlaybackMode = audioPlaybackMode;
             this.playing = playing;

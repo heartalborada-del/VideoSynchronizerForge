@@ -29,6 +29,7 @@ import org.arkcraft.video_synchronizer.block.VideoManagerBlockEntity;
 import org.arkcraft.video_synchronizer.network.model.AudioPlaybackMode;
 import org.arkcraft.video_synchronizer.network.model.ScreenAccessRole;
 import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.model.VideoBackend;
 
 import java.util.Locale;
 import java.util.UUID;
@@ -301,6 +302,7 @@ public final class ServerVideoEvents {
             }
             ServerVideoSessionManager.startForScreen(source.getServer(), screenId,
                     url.trim(), "", "", "", false, 0, VideoPixelFormat.RGB24,
+                    VideoBackend.FFMPEG,
                     VideoManagerBlockEntity.DEFAULT_AUDIO_RANGE,
                     AudioPlaybackMode.POSITIONAL, player.getGameProfile().getName(),
                     player.getUUID());

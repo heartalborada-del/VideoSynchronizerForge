@@ -4,6 +4,7 @@ import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.network.model.AudioPlaybackMode;
 import org.arkcraft.video_synchronizer.network.model.MediaRequestOptions;
 import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.model.VideoBackend;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.FriendlyByteBuf;
@@ -25,7 +26,7 @@ import java.util.function.Supplier;
 public record OpenVideoManagerMessage(BlockPos pos, String screenId, String videoUrl,
                                       String audioUrl, String requestHeaders, String cookie,
                                       boolean disableScaling, int videoPipeLanes,
-                                      VideoPixelFormat videoPixelFormat,
+                                      VideoPixelFormat videoPixelFormat, VideoBackend videoBackend,
                                       double audioRange, AudioPlaybackMode audioPlaybackMode,
                                       boolean active, long positionMs, long durationMs,
                                       boolean live, boolean playing, boolean waitingForClients,
@@ -42,6 +43,7 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
         buf.writeBoolean(disableScaling);
         buf.writeVarInt(videoPipeLanes);
         buf.writeEnum(videoPixelFormat);
+        buf.writeEnum(videoBackend);
         buf.writeDouble(audioRange);
         buf.writeEnum(audioPlaybackMode);
         buf.writeBoolean(active);
@@ -71,6 +73,7 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
                 buf.readUtf(MediaRequestOptions.MAX_COOKIE_LENGTH), buf.readBoolean(),
                 buf.readVarInt(),
                 buf.readEnum(VideoPixelFormat.class),
+                buf.readEnum(VideoBackend.class),
                 buf.readDouble(),
                 buf.readEnum(AudioPlaybackMode.class),
                 buf.readBoolean(),
@@ -117,12 +120,15 @@ public record OpenVideoManagerMessage(BlockPos pos, String screenId, String vide
                 ? state.videoPipeLanes() : manager.getVideoPipeLanes();
         VideoPixelFormat videoPixelFormat = state.active()
                 ? state.videoPixelFormat() : manager.getVideoPixelFormat();
+        VideoBackend videoBackend = state.active()
+                ? state.videoBackend() : manager.getVideoBackend();
         double audioRange = state.active() ? state.audioRange() : manager.getAudioRange();
         AudioPlaybackMode audioPlaybackMode = state.active()
                 ? state.audioPlaybackMode() : manager.getAudioPlaybackMode();
         VideoNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
                 new OpenVideoManagerMessage(pos, manager.getScreenId(), videoUrl, audioUrl,
                         requestHeaders, cookie, disableScaling, videoPipeLanes, videoPixelFormat,
+                        videoBackend,
                         audioRange, audioPlaybackMode,
                         state.active(), state.positionMs(), state.durationMs(), state.live(),
                         state.playing(), state.waitingForClients(), canControl, canEdit,

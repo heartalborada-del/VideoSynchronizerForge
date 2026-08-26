@@ -57,8 +57,13 @@ public final class ScreenTexture {
     }
 
     public static ScreenTexture forSession(String sessionId, VideoFrameBuffer frameBuffer) {
-        return INSTANCES.computeIfAbsent(sessionId,
-                ignored -> new ScreenTexture(sessionId, frameBuffer));
+        return INSTANCES.compute(sessionId, (ignored, existing) -> {
+            if (existing == null || existing.frameBuffer == frameBuffer) {
+                return existing == null ? new ScreenTexture(sessionId, frameBuffer) : existing;
+            }
+            existing.scheduleClose();
+            return new ScreenTexture(sessionId, frameBuffer);
+        });
     }
 
     public static ScreenTexture forSession(String sessionId) {
@@ -142,6 +147,17 @@ public final class ScreenTexture {
 
     public float aspectRatio() {
         return height == 0 ? 16.0F / 9.0F : width / (float) height;
+    }
+
+    /** Returns render-thread diagnostics for the playback test screen. */
+    public DebugInfo debugInfo() {
+        return new DebugInfo(location, width, height, statsUploadedFrames, statsLastPositionMs,
+                frameBuffer.stats());
+    }
+
+    public record DebugInfo(@Nullable ResourceLocation location, int width, int height,
+                            long uploadedFrames, long lastUploadedPositionMs,
+                            VideoFrameBuffer.Stats bufferStats) {
     }
 
     private void upload(VideoFrameBuffer.DecodedFrame frame) {

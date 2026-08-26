@@ -6,14 +6,15 @@ import org.arkcraft.video_synchronizer.server.ServerVideoSessionManager;
 
 import java.util.function.Supplier;
 
-/** Client -> server result of the local FFmpeg and ffprobe executable check. */
-public record VideoClientCapabilityMessage(boolean playbackAvailable) {
+/** Client -> server result of the local decoder backend checks. */
+public record VideoClientCapabilityMessage(boolean ffmpegAvailable, boolean vlcjAvailable) {
     public void encode(FriendlyByteBuf buf) {
-        buf.writeBoolean(playbackAvailable);
+        buf.writeBoolean(ffmpegAvailable);
+        buf.writeBoolean(vlcjAvailable);
     }
 
     public static VideoClientCapabilityMessage decode(FriendlyByteBuf buf) {
-        return new VideoClientCapabilityMessage(buf.readBoolean());
+        return new VideoClientCapabilityMessage(buf.readBoolean(), buf.readBoolean());
     }
 
     public static void handle(VideoClientCapabilityMessage message,
@@ -25,7 +26,7 @@ public record VideoClientCapabilityMessage(boolean playbackAvailable) {
         var server = sender.getServer();
         if (server != null) {
             ServerVideoSessionManager.acceptClientCapability(server, sender,
-                    message.playbackAvailable());
+                    message.ffmpegAvailable(), message.vlcjAvailable());
         }
     }
 }

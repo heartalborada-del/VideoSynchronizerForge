@@ -29,7 +29,7 @@ import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoTimeSyncR
 
 /** The single protocol used by both sides of a video session. */
 public final class VideoNetwork {
-    private static final String PROTOCOL = "22";
+    private static final String PROTOCOL = "24";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(Main.MODID, "sync"),
             () -> PROTOCOL,

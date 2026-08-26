@@ -6,11 +6,14 @@ import net.minecraft.network.chat.Component;
 import org.arkcraft.video_synchronizer.Main;
 import org.arkcraft.video_synchronizer.client.gui.VideoManagerScreen;
 import org.arkcraft.video_synchronizer.client.player.FfmpegPlaybackAdapter;
+import org.arkcraft.video_synchronizer.client.player.VlcjPlaybackAdapter;
+import org.arkcraft.video_synchronizer.client.render.ScreenTexture;
 import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoClientCapabilityMessage;
 import org.arkcraft.video_synchronizer.network.model.AudioPlaybackMode;
 import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoLocalPauseMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.model.VideoBackend;
 import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoPlaybackErrorMessage;
 import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoPlaybackNoticeMessage;
 import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoProgressMessage;
@@ -24,6 +27,7 @@ import org.arkcraft.video_synchronizer.network.packet.clientbound.VideoTimeSyncR
 
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -47,6 +51,8 @@ public final class ClientVideoState {
     private static final Map<String, SessionState> SESSIONS = new ConcurrentHashMap<>();
     private static boolean playbackAvailabilityKnown;
     private static boolean playbackAvailable;
+    private static boolean ffmpegAvailable;
+    private static boolean vlcjAvailable;
     private static boolean capabilityReported;
     private static boolean availabilityNoticeShown;
     private static boolean clientPaused;
@@ -65,15 +71,22 @@ public final class ClientVideoState {
     }
 
     public static void setPlaybackAvailability(boolean available) {
+        setPlaybackAvailability(available, available);
+    }
+
+    public static void setPlaybackAvailability(boolean ffmpegAvailable, boolean vlcjAvailable) {
         playbackAvailabilityKnown = true;
-        playbackAvailable = available;
+        ClientVideoState.ffmpegAvailable = ffmpegAvailable;
+        ClientVideoState.vlcjAvailable = vlcjAvailable;
+        playbackAvailable = ffmpegAvailable || vlcjAvailable;
         capabilityReported = false;
         availabilityNoticeShown = false;
-        if (!available) {
+        if (!playbackAvailable) {
             SESSIONS.values().forEach(session -> {
                 if (session.adapter != null) {
                     session.adapter.dispose();
                     session.adapter = null;
+                    session.adapterBackend = null;
                 }
             });
         }
@@ -98,6 +111,8 @@ public final class ClientVideoState {
         session.disableScaling = message.disableScaling();
         session.videoPipeLanes = message.videoPipeLanes();
         session.videoPixelFormat = message.videoPixelFormat();
+        session.videoBackend = message.videoBackend() == null
+                ? VideoBackend.FFMPEG : message.videoBackend();
         session.audioRange = message.audioRange();
         session.audioPlaybackMode = message.audioPlaybackMode();
         session.durationMs = message.durationMs();
@@ -123,6 +138,13 @@ public final class ClientVideoState {
                         + "sameSession={}", session.sessionId, session.videoId, session.positionMs,
                 session.durationMs, session.playing, session.waitingForClients,
                 session.revision, sameSession);
+        if (session.adapter != null) {
+            if (session.adapterBackend != session.videoBackend) {
+                session.adapter.dispose();
+                session.adapter = null;
+                session.adapterBackend = null;
+            }
+        }
         if (session.adapter != null) {
             if (!sameSession) {
                 session.adapter.open(session.videoId, session.videoUrl, session.audioUrl,
@@ -233,7 +255,7 @@ public final class ClientVideoState {
         }
         for (SessionState session : SESSIONS.values()) {
             updateSessionLoading(session);
-            if (!playbackAvailable || session.adapter == null) {
+            if (!isBackendAvailable(session) || session.adapter == null) {
                 continue;
             }
             session.adapter.clientTick();
@@ -284,12 +306,13 @@ public final class ClientVideoState {
     }
 
     private static void updateSessionLoading(SessionState session) {
-        boolean loadRequired = playbackAvailable && session.initialized
+        boolean loadRequired = isBackendAvailable(session) && session.initialized
                 && !session.awaitingForcedResync && shouldLoad(session);
         if (!loadRequired) {
             if (session.adapter != null) {
                 session.adapter.dispose();
                 session.adapter = null;
+                session.adapterBackend = null;
                 session.readinessReported = false;
                 session.clearPendingCorrection();
                 Main.LOGGER.debug("Unloaded distant video session: session={}",
@@ -300,7 +323,8 @@ public final class ClientVideoState {
         if (session.adapter != null) {
             return;
         }
-        session.adapter = new FfmpegPlaybackAdapter(session.sessionId);
+        session.adapter = createAdapter(session);
+        session.adapterBackend = session.videoBackend;
         session.adapter.openAt(session.videoId, session.videoUrl, session.audioUrl,
                 session.requestHeaders, session.cookie, session.disableScaling,
                 session.videoPipeLanes, session.videoPixelFormat, session.audioRange,
@@ -371,6 +395,16 @@ public final class ClientVideoState {
         }
     }
 
+    private static PlaybackAdapter createAdapter(SessionState session) {
+        return session.videoBackend == VideoBackend.VLCJ
+                ? new VlcjPlaybackAdapter(session.sessionId)
+                : new FfmpegPlaybackAdapter(session.sessionId);
+    }
+
+    private static boolean isBackendAvailable(SessionState session) {
+        return session.videoBackend == VideoBackend.VLCJ ? vlcjAvailable : ffmpegAvailable;
+    }
+
     /** Returns the local monotonic render clock, or -1 until the first frame starts it. */
     public static long renderPositionMs(String sessionId) {
         SessionState session = SESSIONS.get(sessionId);
@@ -379,6 +413,38 @@ public final class ClientVideoState {
             return -1L;
         }
         return session.adapter.positionMs();
+    }
+
+    /** Returns a render-thread-friendly snapshot for the playback test screen. */
+    public static List<DebugSession> debugSessions() {
+        return SESSIONS.values().stream()
+                .sorted((left, right) -> left.sessionId.compareTo(right.sessionId))
+                .map(ClientVideoState::debugSession)
+                .toList();
+    }
+
+    private static DebugSession debugSession(SessionState session) {
+        PlaybackAdapter adapter = session.adapter;
+        ScreenTexture texture = ScreenTexture.forSession(session.sessionId);
+        ScreenTexture.DebugInfo textureInfo = texture == null ? null : texture.debugInfo();
+        long positionMs = adapter == null ? session.positionMs : adapter.positionMs();
+        long durationMs = adapter == null ? session.durationMs : adapter.durationMs();
+        boolean playing = adapter == null ? session.playing : adapter.isPlaying();
+        boolean live = session.live || (adapter != null && adapter.isLiveStream());
+        boolean clockStarted = adapter != null && adapter.isPlaybackClockStarted();
+        boolean ready = adapter != null && adapter.isPlaybackReady();
+        boolean preparingSeek = adapter != null && adapter.isPreparingSeek();
+        boolean reconnecting = adapter != null && adapter.isReconnecting();
+        return new DebugSession(session.sessionId, session.videoId, positionMs, durationMs,
+                playing, session.waitingForClients, live, adapter != null, clockStarted,
+                ready, preparingSeek, reconnecting, textureInfo);
+    }
+
+    public record DebugSession(String sessionId, String videoId, long positionMs,
+                               long durationMs, boolean playing, boolean waitingForClients,
+                               boolean live, boolean decoderLoaded, boolean clockStarted,
+                               boolean playbackReady, boolean preparingSeek, boolean reconnecting,
+                               ScreenTexture.DebugInfo textureInfo) {
     }
 
     public static void requestResync() {
@@ -397,6 +463,7 @@ public final class ClientVideoState {
             if (session.adapter != null) {
                 session.adapter.dispose();
                 session.adapter = null;
+                session.adapterBackend = null;
             }
         });
         String sessionId = SESSIONS.keySet().iterator().next();
@@ -479,10 +546,15 @@ public final class ClientVideoState {
             clearProgressOverlay();
             return;
         }
-        if (!playbackAvailable) {
-            String statusKey = playbackAvailabilityKnown
-                    ? "overlay.video_synchronizer.ffmpeg_unavailable"
-                    : "overlay.video_synchronizer.ffmpeg_checking";
+        if (!playbackAvailabilityKnown || !isBackendAvailable(session)) {
+            String statusKey;
+            if (!playbackAvailabilityKnown) {
+                statusKey = "overlay.video_synchronizer.backend_checking";
+            } else {
+                statusKey = session.videoBackend == VideoBackend.VLCJ
+                        ? "overlay.video_synchronizer.vlcj_unavailable"
+                        : "overlay.video_synchronizer.ffmpeg_unavailable";
+            }
             minecraft.gui.setOverlayMessage(Component.translatable(statusKey)
                     .withStyle(playbackAvailabilityKnown ? ChatFormatting.RED : ChatFormatting.YELLOW,
                             ChatFormatting.BOLD), false);
@@ -514,10 +586,13 @@ public final class ClientVideoState {
                 ? session.durationMs : session.adapter.durationMs();
         boolean currentPlaying = session.adapter == null
                 ? session.playing : session.adapter.isPlaying();
-        ChatFormatting stateColor = session.waitingForClients ? ChatFormatting.LIGHT_PURPLE
+        boolean waitingForFirstFrame = session.adapter != null
+                && !session.adapter.isPlaybackReady();
+        boolean buffering = session.waitingForClients || waitingForFirstFrame;
+        ChatFormatting stateColor = buffering ? ChatFormatting.LIGHT_PURPLE
                 : (currentPlaying ? ChatFormatting.GREEN : ChatFormatting.YELLOW);
         minecraft.gui.setOverlayMessage(Component.empty()
-                .append(Component.translatable(session.waitingForClients
+                .append(Component.translatable(buffering
                                 ? "overlay.video_synchronizer.progress_buffering"
                                 : (currentPlaying ? "overlay.video_synchronizer.progress_playing"
                                 : "overlay.video_synchronizer.progress_paused"))
@@ -582,12 +657,17 @@ public final class ClientVideoState {
         if (minecraft.player == null || minecraft.getConnection() == null) {
             return;
         }
-        VideoNetwork.CHANNEL.sendToServer(new VideoClientCapabilityMessage(playbackAvailable));
+        VideoNetwork.CHANNEL.sendToServer(new VideoClientCapabilityMessage(
+                ffmpegAvailable, vlcjAvailable));
         capabilityReported = true;
     }
 
     private static void maybeShowPlaybackUnavailableNotice() {
-        if (!playbackAvailabilityKnown || playbackAvailable || availabilityNoticeShown) {
+        if (!playbackAvailabilityKnown || availabilityNoticeShown) {
+            return;
+        }
+        SessionState session = nearestSession();
+        if (session == null || isBackendAvailable(session)) {
             return;
         }
         Minecraft minecraft = Minecraft.getInstance();
@@ -595,7 +675,9 @@ public final class ClientVideoState {
             return;
         }
         minecraft.player.displayClientMessage(Component.translatable(
-                "message.video_synchronizer.ffmpeg_unavailable"), false);
+                session.videoBackend == VideoBackend.VLCJ
+                        ? "message.video_synchronizer.vlcj_unavailable"
+                        : "message.video_synchronizer.ffmpeg_unavailable"), false);
         availabilityNoticeShown = true;
     }
 
@@ -665,6 +747,7 @@ public final class ClientVideoState {
         private boolean disableScaling;
         private int videoPipeLanes;
         private VideoPixelFormat videoPixelFormat = VideoPixelFormat.RGB24;
+        private VideoBackend videoBackend = VideoBackend.FFMPEG;
         private double audioRange = 48.0D;
         private AudioPlaybackMode audioPlaybackMode = AudioPlaybackMode.POSITIONAL;
         private long durationMs;
@@ -683,6 +766,7 @@ public final class ClientVideoState {
         private long routineCorrectionWindowStartedNanos;
         private long progressSwitchUntilNanos;
         private PlaybackAdapter adapter;
+        private VideoBackend adapterBackend;
 
         private SessionState(String sessionId) {
             this.sessionId = sessionId;

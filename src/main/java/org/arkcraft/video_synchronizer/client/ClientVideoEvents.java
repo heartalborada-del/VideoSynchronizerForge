@@ -1,12 +1,14 @@
 package org.arkcraft.video_synchronizer.client;
 
 import net.minecraft.client.Minecraft;
+import net.minecraftforge.client.event.InputEvent;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import org.arkcraft.video_synchronizer.Main;
+import org.arkcraft.video_synchronizer.client.gui.OpenGLTestScreen;
 import org.arkcraft.video_synchronizer.client.render.ScreenTexture;
 
 @Mod.EventBusSubscriber(modid = Main.MODID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
@@ -30,6 +32,20 @@ public final class ClientVideoEvents {
         // Render ticks continue while the single-player pause screen is open. Check
         // both phases because Minecraft updates its internal pause flag during a frame.
         ClientVideoState.setClientPaused(shouldPauseLocalPlayback());
+    }
+
+    @SubscribeEvent
+    public static void onKeyInput(InputEvent.Key event) {
+        if (!ClientVideoSetup.debugUiEnabled()) {
+            return;
+        }
+        if (!ClientVideoSetup.OPENGL_TEST_KEY.consumeClick()) {
+            return;
+        }
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.screen == null) {
+            OpenGLTestScreen.open();
+        }
     }
 
     private static boolean shouldPauseLocalPlayback() {

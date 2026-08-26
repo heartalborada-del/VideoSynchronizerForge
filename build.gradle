@@ -453,6 +453,17 @@ dependencies {
     // then special handling is done to allow a setup of a vanilla dependency without the use of an external repository.
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
 
+    // Optional client-side decoder backend. LibVLC itself remains a system prerequisite;
+    // VLCJ supplies the Java bindings and native-discovery support.
+    minecraftLibrary 'uk.co.caprica:vlcj:4.8.3'
+    minecraftLibrary 'uk.co.caprica:vlcj-natives:4.8.3'
+    jarJar(implementation('uk.co.caprica:vlcj:4.8.3')) {
+        jarJar.ranged(it, '[4.8.3,4.8.4)')
+    }
+    jarJar(implementation('uk.co.caprica:vlcj-natives:4.8.3')) {
+        jarJar.ranged(it, '[4.8.3,4.8.4)')
+    }
+
     // Example mod dependency with JEI - using fg.deobf() ensures the dependency is remapped to your development mappings
     // The JEI API is declared for compile time use, while the full JEI artifact is used at runtime
     // compileOnly fg.deobf("mezz.jei:jei-${mc_version}-common-api:${jei_version}")
@@ -496,9 +507,7 @@ tasks.named('processResources', ProcessResources).configure {
 
 // Example for how to get properties into the manifest for reading at runtime.
 tasks.named('jar', Jar).configure {
-    if (embeddedFfmpegPlatformProperty.isPresent()) {
-        archiveClassifier.set(embeddedFfmpegClassifiers[embeddedFfmpegPlatform])
-    }
+    archiveClassifier.set(embeddedFfmpegClassifiers[embeddedFfmpegPlatform] + '-thin')
     manifest {
         attributes(["Specification-Title"     : mod_id,
                     "Specification-Vendor"    : mod_authors,
@@ -511,6 +520,12 @@ tasks.named('jar', Jar).configure {
 
     // This is the preferred method to reobfuscate your jar file
     finalizedBy 'reobfJar'
+}
+
+// The distributable artifact must be the JarJar output so VLCJ and its JNA
+// dependencies are available when the mod is installed outside the dev runtime.
+tasks.named('jarJar', Jar).configure {
+    archiveClassifier.set(embeddedFfmpegClassifiers[embeddedFfmpegPlatform])
 }
 
 tasks.withType(JavaCompile).configureEach {

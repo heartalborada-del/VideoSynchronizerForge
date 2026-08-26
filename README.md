@@ -14,13 +14,17 @@ preserving a smooth and synchronized playback experience for every player.
 ## Features
 
 - Server-authoritative pause, resume, seek, reconnect, and late-join synchronization for
-  on-demand media; live streams play independently at each client's current live edge.
+  on-demand media; live streams play independently at each client's current live edge and
+  start locally as soon as that client has verified the stream, without waiting for peers.
 - Continuous screens on walls, floors, and ceilings, up to 1024 x 1024 blocks.
 - Independent screens can run simultaneous playback sessions through their Video Managers.
-- HTTP(S) MP4, HLS, and split DASH video/audio support through FFmpeg.
+- HTTP(S) MP4, HLS, and split DASH video/audio support through selectable FFmpeg CLI or
+  VLCJ/LibVLC client decoding backends.
 - Screen audio supports positional fading, fixed volume within a configurable 1-1024 block
   range, or full-volume server-wide broadcast.
 - Commands and an in-world Video Manager GUI for playback control.
+- Development builds only: press F8 in-game to preview the active OpenGL video texture and
+  decoder status.
 - Craftable Screen Panels, Video Managers, and a reusable Screen Selection Tool support
   normal survival play without generating free screen blocks.
 - Screen owners can grant playback or editing access through the Video Manager. Editable
@@ -35,6 +39,10 @@ preserving a smooth and synchronized playback experience for every player.
 - Minecraft Forge 1.20.1
 - Java 17
 - FFmpeg and ffprobe on `PATH` when using the `no-ffmpeg` build
+- VLCJ playback also requires a compatible VLC/LibVLC installation on clients that select it.
+  Windows clients search the standard VideoLAN install directories; for a custom location,
+  launch Java with `-Dvideo_synchronizer.vlcPath=<VLC directory>` where `libvlc.dll`,
+  `libvlccore.dll`, and `plugins` are present. VLC and Java must use the same architecture.
 
 Choose the release JAR matching the client's system: Linux or Windows on AMD64 or ARM64.
 These builds include FFmpeg. The platform-independent `no-ffmpeg` JAR uses the FFmpeg
@@ -96,8 +104,13 @@ Servers can override the default player permissions through Forge permission nod
 
 ## Notes
 
-- New sessions and seeks wait for most online clients to become ready. Reconnecting and
-  late-joining players automatically synchronize to the active session.
+- New on-demand sessions and seeks wait for most online clients to become ready. Live
+  sessions start after the first client verifies its local stream; other clients join at
+  their own live edge. Reconnecting and late-joining players automatically synchronize to
+  the active session.
+- Live streams retain live-edge input timing and their automatic small-frame pipeline path;
+  configured pipeline counts and long-running video-clock audio rebasing apply to on-demand
+  media.
 - When playback is opened after `/video sync` or re-entering a screen's audio range, the
   authoritative position is installed atomically before decoder startup. Immediately before
   FFmpeg starts, playing sessions project that position by the time elapsed during media
@@ -105,8 +118,9 @@ Servers can override the default player permissions through Forge permission nod
 - Initial nonzero synchronization opens FFmpeg up to four seconds before that target, then
   rapidly discards preroll audio and video without displaying it. This gives remote media a
   usable earlier keyframe while the first visible frame still represents the current server time.
-- Clients validate both `ffmpeg` and `ffprobe` at startup. Clients that fail validation
-  cannot play video and are excluded from preload thresholds and clock consensus.
+- Clients validate the selected decoder backend at startup. FFmpeg clients check both
+  `ffmpeg` and `ffprobe`; VLCJ clients check LibVLC. Clients that fail validation cannot
+  play video and are excluded from preload thresholds and clock consensus.
 - Clients first use a bounded metadata probe to avoid excessive startup buffering for long
   media, then automatically retry with full analysis when the quick result is incomplete.
 - Media using one video output lane and one URL shares a single FFmpeg process for audio and
@@ -131,9 +145,9 @@ Servers can override the default player permissions through Forge permission nod
 - Falling behind the playback clock does not by itself restart FFmpeg. Bounded frame queues keep
   the newest useful video frame, while a decoder restart is reserved for confirmed output stalls
   or failures.
-- The first-frame timeout is an absolute deadline for a complete raw frame. Partial bytes cannot
-  indefinitely postpone recovery; after playback is established, stall timing follows the last
-  output progress instead.
+- Live decoders use a separate startup window for the first keyframe. Once output begins, all
+  video lanes share the same byte-progress watchdog, and a decoder restarts only after output
+  makes no progress for the live stall interval.
 - Routine drift correction waits for a full five-second sample window and seeks only when
   the average offset remains at least 750 ms, avoiding startup corrections and seeks caused
   by isolated latency spikes.

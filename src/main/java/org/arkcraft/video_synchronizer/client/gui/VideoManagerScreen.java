@@ -14,6 +14,7 @@ import org.arkcraft.video_synchronizer.network.model.MediaRequestOptions;
 import org.arkcraft.video_synchronizer.network.packet.serverbound.VideoManagerActionMessage;
 import org.arkcraft.video_synchronizer.network.VideoNetwork;
 import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
+import org.arkcraft.video_synchronizer.network.model.VideoBackend;
 import org.arkcraft.video_synchronizer.server.ScreenAccessMode;
 import org.arkcraft.video_synchronizer.network.model.ScreenAccessRole;
 import org.arkcraft.video_synchronizer.network.packet.serverbound.ScreenPermissionActionMessage;
@@ -34,6 +35,7 @@ public final class VideoManagerScreen extends Screen {
     private boolean disableScaling;
     private int videoPipeLanes;
     private VideoPixelFormat videoPixelFormat;
+    private VideoBackend videoBackend;
     private double audioRange;
     private AudioPlaybackMode audioPlaybackMode;
     private boolean active;
@@ -57,6 +59,7 @@ public final class VideoManagerScreen extends Screen {
     private EditBox audioRangeInput;
     private Button audioModeButton;
     private Button streamModeButton;
+    private Button backendButton;
     private Button scalingButton;
     private Button pipeLanesButton;
     private Button pixelFormatButton;
@@ -151,12 +154,20 @@ public final class VideoManagerScreen extends Screen {
 
         int modeButtonSize = 20;
         int modeButtonGap = 4;
+        int backendButtonWidth = 42;
+        int backendButtonGap = 4;
         videoUrlInput = new EditBox(font, formLeft, formTop + 59,
-                formWidth - modeButtonSize - modeButtonGap, 20,
+                formWidth - modeButtonSize - modeButtonGap - backendButtonWidth - backendButtonGap,
+                20,
                 Component.translatable("gui.video_synchronizer.manager.video_url"));
         videoUrlInput.setMaxLength(2048);
         videoUrlInput.setValue(videoUrl);
         addRenderableWidget(videoUrlInput);
+        backendButton = addRenderableWidget(Button.builder(Component.empty(), button -> {
+                    videoBackend = videoBackend.next();
+                    updateBackendButton();
+                }).bounds(formLeft + formWidth - modeButtonSize - modeButtonGap - backendButtonWidth,
+                        formTop + 59, backendButtonWidth, 20).build());
         streamModeButton = addRenderableWidget(Button.builder(
                 Component.empty(), button -> {
                     splitStreams = !splitStreams;
@@ -261,6 +272,7 @@ public final class VideoManagerScreen extends Screen {
         updateScalingButton();
         updatePipeLanesButton();
         updatePixelFormatButton();
+        updateBackendButton();
         updateAudioModeButton();
         updateButtonState();
     }
@@ -326,6 +338,7 @@ public final class VideoManagerScreen extends Screen {
         disableScaling = message.disableScaling();
         videoPipeLanes = normalizeVideoPipeLanes(message.videoPipeLanes());
         videoPixelFormat = message.videoPixelFormat();
+        videoBackend = message.videoBackend() == null ? VideoBackend.FFMPEG : message.videoBackend();
         audioRange = message.audioRange();
         audioPlaybackMode = message.audioPlaybackMode();
         splitStreams = !audioUrl.isBlank();
@@ -352,6 +365,7 @@ public final class VideoManagerScreen extends Screen {
             updateScalingButton();
             updatePipeLanesButton();
             updatePixelFormatButton();
+            updateBackendButton();
             updateAudioModeButton();
             updateButtonState();
         }
@@ -385,6 +399,7 @@ public final class VideoManagerScreen extends Screen {
                 managerPos, action, screenIdInput.getValue(), videoUrlInput.getValue(),
                 splitStreams ? audioUrlInput.getValue() : "", requestHeaders, cookie,
                 disableScaling, videoPipeLanes, videoPixelFormat,
+                videoBackend,
                 requestedAudioRange, audioPlaybackMode,
                 requestedPosition));
     }
@@ -488,6 +503,17 @@ public final class VideoManagerScreen extends Screen {
                 "gui.video_synchronizer.manager.pixel_format_tooltip")));
     }
 
+    private void updateBackendButton() {
+        if (backendButton == null || videoBackend == null) {
+            return;
+        }
+        backendButton.setMessage(Component.literal(videoBackend.id().toUpperCase(Locale.ROOT)));
+        backendButton.setTooltip(Tooltip.create(Component.translatable(
+                "gui.video_synchronizer.manager.backend_tooltip",
+                Component.translatable("gui.video_synchronizer.manager.backend_"
+                        + videoBackend.id()))));
+    }
+
     private void updateAudioModeButton() {
         if (audioModeButton == null || audioRangeInput == null) {
             return;
@@ -537,6 +563,7 @@ public final class VideoManagerScreen extends Screen {
         screenIdInput.active = canEdit;
         videoUrlInput.active = canEdit;
         streamModeButton.active = canEdit;
+        backendButton.active = canEdit;
         headersButton.active = canEdit && requestMetadataAllowed;
         cookieButton.active = canEdit && requestMetadataAllowed;
         scalingButton.active = canEdit;

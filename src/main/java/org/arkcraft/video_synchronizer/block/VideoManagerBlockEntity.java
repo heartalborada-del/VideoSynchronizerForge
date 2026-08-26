@@ -7,6 +7,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import org.arkcraft.video_synchronizer.Main;
 import org.arkcraft.video_synchronizer.network.model.VideoPixelFormat;
 import org.arkcraft.video_synchronizer.network.model.AudioPlaybackMode;
+import org.arkcraft.video_synchronizer.network.model.VideoBackend;
 
 import java.util.UUID;
 
@@ -21,6 +22,7 @@ public final class VideoManagerBlockEntity extends BlockEntity {
     private boolean disableScaling;
     private int videoPipeLanes;
     private VideoPixelFormat videoPixelFormat = VideoPixelFormat.RGB24;
+    private VideoBackend videoBackend = VideoBackend.FFMPEG;
     private double audioRange = DEFAULT_AUDIO_RANGE;
     private AudioPlaybackMode audioPlaybackMode = AudioPlaybackMode.POSITIONAL;
     private UUID ownerId;
@@ -61,6 +63,10 @@ public final class VideoManagerBlockEntity extends BlockEntity {
         return videoPixelFormat;
     }
 
+    public VideoBackend getVideoBackend() {
+        return videoBackend;
+    }
+
     public double getAudioRange() {
         return audioRange;
     }
@@ -86,9 +92,9 @@ public final class VideoManagerBlockEntity extends BlockEntity {
 
     public void setConfiguration(String screenId, String videoUrl, String audioUrl,
                                  String requestHeaders, String cookie,
-                                 boolean disableScaling, int videoPipeLanes,
-                                 VideoPixelFormat videoPixelFormat, double audioRange,
-                                 AudioPlaybackMode audioPlaybackMode) {
+                                  boolean disableScaling, int videoPipeLanes,
+                                  VideoPixelFormat videoPixelFormat, VideoBackend videoBackend,
+                                  double audioRange, AudioPlaybackMode audioPlaybackMode) {
         this.screenId = screenId;
         this.videoUrl = videoUrl;
         this.audioUrl = audioUrl;
@@ -98,6 +104,7 @@ public final class VideoManagerBlockEntity extends BlockEntity {
         this.videoPipeLanes = normalizeVideoPipeLanes(videoPipeLanes);
         this.videoPixelFormat = videoPixelFormat == null
                 ? VideoPixelFormat.RGB24 : videoPixelFormat;
+        this.videoBackend = videoBackend == null ? VideoBackend.FFMPEG : videoBackend;
         this.audioRange = audioRange;
         this.audioPlaybackMode = audioPlaybackMode == null
                 ? AudioPlaybackMode.POSITIONAL : audioPlaybackMode;
@@ -115,6 +122,7 @@ public final class VideoManagerBlockEntity extends BlockEntity {
         tag.putBoolean("DisableScaling", disableScaling);
         tag.putInt("VideoPipeLanes", videoPipeLanes);
         tag.putString("VideoPixelFormat", videoPixelFormat.name());
+        tag.putString("VideoBackend", videoBackend.name());
         tag.putDouble("AudioRange", audioRange);
         tag.putString("AudioPlaybackMode", audioPlaybackMode.name());
         if (ownerId != null) {
@@ -134,6 +142,7 @@ public final class VideoManagerBlockEntity extends BlockEntity {
         disableScaling = tag.getBoolean("DisableScaling");
         videoPipeLanes = normalizeVideoPipeLanes(tag.getInt("VideoPipeLanes"));
         videoPixelFormat = VideoPixelFormat.fromName(tag.getString("VideoPixelFormat"));
+        videoBackend = VideoBackend.fromName(tag.getString("VideoBackend"));
         audioRange = normalizeAudioRange(tag.contains("AudioRange")
                 ? tag.getDouble("AudioRange") : DEFAULT_AUDIO_RANGE);
         audioPlaybackMode = AudioPlaybackMode.fromName(tag.getString("AudioPlaybackMode"));
