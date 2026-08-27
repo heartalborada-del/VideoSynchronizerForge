@@ -97,10 +97,11 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             "video_synchronizer.audioMaxDistance", 48.0D);
     private static final int AUDIO_FRAME_SIZE = AUDIO_CHANNELS * Short.BYTES;
     private static final int AUDIO_CHUNK_FRAMES = AUDIO_SAMPLE_RATE / 50;
+    /* Keep the device queue short; BufferedAudioInput below provides the network jitter buffer. */
     private static final int AUDIO_BUFFER_FRAMES = Math.max(AUDIO_CHUNK_FRAMES,
             AUDIO_SAMPLE_RATE * positiveIntegerProperty(
-                    "video_synchronizer.audioLineBufferMs", 1_000) / 1000);
-    /* Each chunk is 20 ms at the fixed 50 Hz reader cadence; cap the queue at about 10 s. */
+                    "video_synchronizer.audioLineBufferMs", 100) / 1000);
+    /* Each chunk is 20 ms at the fixed 50 Hz reader cadence; cap the input queue at about 10 s. */
     private static final int AUDIO_PCM_QUEUE_CHUNKS = Math.min(500, positiveIntegerProperty(
             "video_synchronizer.audioPcmQueueChunks", 500));
     /* Live audio must stay close to the edge instead of accumulating startup history. */
@@ -139,6 +140,13 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     private static final long AUDIO_STALL_TIMEOUT_MS = 5_000L;
     private static final long AUDIO_VIDEO_RESYNC_THRESHOLD_MS = positiveLongProperty(
             "video_synchronizer.audioVideoResyncThresholdMs", 250L);
+    /* Correct independent audio gradually instead of flushing the device line. */
+    private static final long AUDIO_SOFT_SYNC_THRESHOLD_MS = positiveLongProperty(
+            "video_synchronizer.audioSoftSyncThresholdMs", 80L);
+    private static final int AUDIO_SOFT_SYNC_MAX_PPM = Math.min(50_000,
+            positiveIntegerProperty("video_synchronizer.audioSoftSyncMaxPpm", 20_000));
+    private static final long AUDIO_SOFT_SYNC_WAIT_MAX_MS = positiveLongProperty(
+            "video_synchronizer.audioSoftSyncWaitMaxMs", 500L);
     private static final long AUDIO_RECOVERY_STABLE_FRAMES = AUDIO_SAMPLE_RATE * 5L;
     private static final int VIDEO_MAX_RECONNECT_ATTEMPTS = 5;
     private static final long VIDEO_RECONNECT_NOTICE_MS = 2_000L;
@@ -766,8 +774,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             int outputLanes = effectiveVideoPipeLanes(frameSize, output.height);
             boolean hasAudio = metadata.hasAudio || separateAudioUrl != null;
             shareAudioWithVideo = metadata.hasAudio
-                    && separateAudioUrl == null && outputLanes <= 1
-                    && !DISCARD_CORRUPT_PACKETS;
+                    && separateAudioUrl == null && outputLanes <= 1;
             String audioDecoderMode = !hasAudio ? "disabled"
                     : shareAudioWithVideo ? "shared" : "independent";
             Main.LOGGER.info("Streaming media decoder opened {}x{} at {} fps "
@@ -1080,7 +1087,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             command.add("auto");
         }
         addBufferedInputOptions(command);
-        addVideoCorruptionToleranceOptions(command);
+        if (sharedAudioOutput == null) {
+            addVideoCorruptionToleranceOptions(command);
+        }
         if (liveStream) {
             addLiveVideoInputOptions(command);
         }
@@ -1885,11 +1894,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
     }
 
     private int effectiveVideoPipeLanes(int frameSize, int frameHeight) {
-        if (!liveStream) {
-            return Math.max(1, activeVideoPipeLanes);
-        }
-        // Preserve the live stream's previous auto mode. Explicit live lane settings still
-        // take effect, while the default keeps small live frames on one shared output.
+        // Keep the automatic small-frame path for both on-demand and live media. Explicit
+        // lane settings still take effect, while the default avoids an unnecessary split
+        // decoder for ordinary 720p playback.
         if (activeVideoPipeLanes <= 1
                 || (!explicitVideoPipeLanes && frameSize < VIDEO_PIPE_MIN_FRAME_BYTES)) {
             return 1;
@@ -2006,7 +2013,9 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             command.add("auto");
         }
         addBufferedInputOptions(command);
-        addVideoCorruptionToleranceOptions(command);
+        if (!shareAudioWithVideo) {
+            addVideoCorruptionToleranceOptions(command);
+        }
         if (liveStream) {
             addLiveVideoInputOptions(command);
         }
@@ -3698,9 +3707,10 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         }
                     }
 
-                    // On-demand audio follows the video timestamp after the initial clock
-                    // start. Live audio keeps its edge-based timing and recovery path.
-                    if (!liveStream && submittedAudio) {
+                    // Live audio follows the current edge closely. Keep the 250 ms hard
+                    // correction for live playback only; flushing on-demand PCM buffers
+                    // during ordinary drift causes an audible gap.
+                    if (liveStream && submittedAudio) {
                         long rawPlayedPositionMs = lineBasePositionMs
                                 + (line.getLongFramePosition() - lineBaseFrame)
                                 * 1000L / AUDIO_SAMPLE_RATE;
@@ -4079,6 +4089,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             long statsBytes = 0L;
             long statsChunks = 0L;
             long statsDiscardedChunks = 0L;
+            long statsSoftDroppedFrames = 0L;
+            long sourceFramesDropped = 0L;
             String processErrors = "";
             AudioReadWatchdog writeWatchdog = new AudioReadWatchdog(decoder, sessionGeneration);
             setActiveLine(line, sessionGeneration);
@@ -4112,6 +4124,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         lineRunning = false;
                         submittedAudio = false;
                         audioEstablished = false;
+                        sourceFramesDropped = 0L;
                     }
                     if (submittedAudio && (!lineRunning || !line.isRunning())) {
                         line.start();
@@ -4172,6 +4185,7 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         }
                         submittedAudio = false;
                         audioEstablished = false;
+                        sourceFramesDropped = 0L;
                         if (chunkEndMs <= catchUpTargetMs) {
                             statsDiscardedChunks++;
                             continue;
@@ -4186,9 +4200,10 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         }
                     }
 
-                    // On-demand video is the long-running clock authority. Live playback
-                    // keeps the previous edge-based PCM timing and does not rebase here.
-                    if (!liveStream && submittedAudio) {
+                    // Live audio follows the current edge closely. Keep the 250 ms hard
+                    // correction for live playback only; flushing on-demand PCM buffers
+                    // during ordinary drift causes an audible gap.
+                    if (liveStream && submittedAudio) {
                         long rawPlayedPositionMs = lineBasePositionMs
                                 + (line.getLongFramePosition() - lineBaseFrame)
                                 * 1000L / AUDIO_SAMPLE_RATE;
@@ -4205,6 +4220,33 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                             Main.LOGGER.debug("Rebasing audio clock to video timestamp: "
                                             + "video={} ms, played={} ms, drift={} ms",
                                     videoPositionMs, rawPlayedPositionMs, driftMs);
+                        }
+                    }
+
+                    if (!liveStream && submittedAudio) {
+                        long playedPositionMs = audioPlayedPositionMs(
+                                lineBasePositionMs, lineBaseFrame, sourceFramesDropped, line);
+                        long driftMs = positionMs() - playedPositionMs;
+                        if (driftMs < -AUDIO_SOFT_SYNC_THRESHOLD_MS && lineRunning) {
+                            long waitDeadlineNanos = System.nanoTime()
+                                    + TimeUnit.MILLISECONDS.toNanos(AUDIO_SOFT_SYNC_WAIT_MAX_MS);
+                            while (isActive(sessionGeneration) && playing && !clientPaused
+                                    && audioRequestedSeekMs.get() < 0L
+                                    && driftMs < -AUDIO_SOFT_SYNC_THRESHOLD_MS
+                                    && System.nanoTime() < waitDeadlineNanos) {
+                                Thread.sleep(2L);
+                                playedPositionMs = audioPlayedPositionMs(
+                                        lineBasePositionMs, lineBaseFrame,
+                                        sourceFramesDropped, line);
+                                driftMs = positionMs() - playedPositionMs;
+                            }
+                        }
+                        int inputFrames = bytesRead / AUDIO_FRAME_SIZE;
+                        int droppedFrames = audioSoftDropFrames(inputFrames, driftMs);
+                        if (droppedFrames > 0) {
+                            bytesRead = compressPcmChunk(pcm, inputFrames, droppedFrames);
+                            sourceFramesDropped += droppedFrames;
+                            statsSoftDroppedFrames += droppedFrames;
                         }
                     }
 
@@ -4250,9 +4292,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                                 chunkPositionMs);
                     }
 
-                    long rawPlayedPositionMs = lineBasePositionMs
-                            + (line.getLongFramePosition() - lineBaseFrame)
-                            * 1000L / AUDIO_SAMPLE_RATE;
+                    long rawPlayedPositionMs = audioPlayedPositionMs(
+                            lineBasePositionMs, lineBaseFrame, sourceFramesDropped, line);
                     long clockPositionMs = positionMs();
                     long driftMs = clockPositionMs - rawPlayedPositionMs;
                     long statsNow = System.nanoTime();
@@ -4263,15 +4304,16 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                         Main.LOGGER.debug("Audio playback stats: pid={}, chunks={} ({} per second), "
                                         + "PCM={} KiB/s, startupDiscarded={}, decoded={} ms, "
                                         + "played={} ms, clock={} ms, drift={} ms, lineRunning={}, "
-                                        + "queuedBytes={}, volume={}",
+                                        + "queuedBytes={}, softDroppedFrames={}, volume={}",
                                 decoder.pid(), statsChunks, statsChunks / elapsedSeconds,
                                 statsBytes / 1024.0D / elapsedSeconds, statsDiscardedChunks,
                                 chunkEndMs, rawPlayedPositionMs, clockPositionMs, driftMs, lineRunning,
-                                queuedBytes, appliedVolume);
+                                queuedBytes, statsSoftDroppedFrames, appliedVolume);
                         statsStartNanos = statsNow;
                         statsBytes = 0L;
                         statsChunks = 0L;
                         statsDiscardedChunks = 0L;
+                        statsSoftDroppedFrames = 0L;
                     }
                 }
                 if (submittedAudio && playing && !clientPaused
@@ -4600,6 +4642,58 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
             } finally {
                 watchdog.end();
             }
+        }
+
+        private static long audioPlayedPositionMs(long basePositionMs, long baseFrame,
+                                                  long sourceFramesDropped, SourceDataLine line) {
+            long outputFrames = Math.max(0L, line.getLongFramePosition() - baseFrame);
+            return basePositionMs + (outputFrames + sourceFramesDropped)
+                    * 1000L / AUDIO_SAMPLE_RATE;
+        }
+
+        private static int audioSoftDropFrames(int inputFrames, long driftMs) {
+            if (inputFrames <= 1 || driftMs <= AUDIO_SOFT_SYNC_THRESHOLD_MS) {
+                return 0;
+            }
+            long correctionPpm = Math.min(AUDIO_SOFT_SYNC_MAX_PPM, driftMs * 20L);
+            long dropped = (inputFrames * correctionPpm + 999_999L) / 1_000_000L;
+            return (int) Math.min(inputFrames - 1L, Math.max(1L, dropped));
+        }
+
+        /** Compresses one PCM block with linear interpolation, preserving frame boundaries. */
+        private static int compressPcmChunk(byte[] pcm, int inputFrames, int droppedFrames) {
+            int outputFrames = inputFrames - droppedFrames;
+            if (outputFrames <= 0 || outputFrames >= inputFrames) {
+                return inputFrames * AUDIO_FRAME_SIZE;
+            }
+            int denominator = outputFrames - 1;
+            int sourceDenominator = inputFrames - 1;
+            for (int outputFrame = 0; outputFrame < outputFrames; outputFrame++) {
+                long numerator = (long) outputFrame * sourceDenominator;
+                int sourceFrame = (int) (numerator / denominator);
+                int remainder = (int) (numerator % denominator);
+                int nextSourceFrame = Math.min(sourceFrame + 1, sourceDenominator);
+                int outputOffset = outputFrame * AUDIO_FRAME_SIZE;
+                int sourceOffset = sourceFrame * AUDIO_FRAME_SIZE;
+                int nextSourceOffset = nextSourceFrame * AUDIO_FRAME_SIZE;
+                for (int channel = 0; channel < AUDIO_CHANNELS; channel++) {
+                    int sample = readPcmSample(pcm, sourceOffset + channel * Short.BYTES);
+                    int nextSample = readPcmSample(pcm,
+                            nextSourceOffset + channel * Short.BYTES);
+                    int interpolated = sample + (nextSample - sample) * remainder / denominator;
+                    writePcmSample(pcm, outputOffset + channel * Short.BYTES, interpolated);
+                }
+            }
+            return outputFrames * AUDIO_FRAME_SIZE;
+        }
+
+        private static int readPcmSample(byte[] pcm, int offset) {
+            return (short) ((pcm[offset] & 0xFF) | (pcm[offset + 1] << 8));
+        }
+
+        private static void writePcmSample(byte[] pcm, int offset, int sample) {
+            pcm[offset] = (byte) sample;
+            pcm[offset + 1] = (byte) (sample >> 8);
         }
 
         /** Applies the client-thread listener snapshot to PCM in-place. */

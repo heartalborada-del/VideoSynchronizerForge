@@ -109,8 +109,9 @@ Servers can override the default player permissions through Forge permission nod
   their own live edge. Reconnecting and late-joining players automatically synchronize to
   the active session.
 - Live streams retain live-edge input timing and their automatic small-frame pipeline path;
-  configured pipeline counts and long-running video-clock audio rebasing apply to on-demand
-  media.
+  explicitly configured pipeline counts apply to both media types, while the default keeps
+  small frames on one lane; live audio uses a 250 ms correction threshold, and on-demand
+  audio follows the video clock with gradual PCM correction instead of hard rebases.
 - When playback is opened after `/video sync` or re-entering a screen's audio range, the
   authoritative position is installed atomically before decoder startup. Immediately before
   FFmpeg starts, playing sessions project that position by the time elapsed during media
