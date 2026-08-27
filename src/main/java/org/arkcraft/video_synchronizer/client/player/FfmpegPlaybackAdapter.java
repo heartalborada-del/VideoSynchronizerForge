@@ -3750,6 +3750,8 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     }
                     spatializeAudio(pcm, bytesRead);
                     writeAudio(line, pcm, bytesRead, writeWatchdog);
+                    boolean recovered = reconnecting;
+                    reconnecting = false;
                     if (!submittedAudio) {
                         submittedAudio = true;
                         audioEstablished = true;
@@ -3759,6 +3761,10 @@ public final class FfmpegPlaybackAdapter implements ClientVideoState.PlaybackAda
                     } else if (!lineRunning || !line.isRunning()) {
                         line.start();
                         lineRunning = true;
+                    }
+                    if (recovered) {
+                        Main.LOGGER.info("Shared synchronized audio connection recovered at {} ms",
+                                chunkPositionMs);
                     }
                     long playedPositionMs = lineBasePositionMs
                             + (line.getLongFramePosition() - lineBaseFrame)
