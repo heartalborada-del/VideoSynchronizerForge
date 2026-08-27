@@ -92,6 +92,10 @@ synchronization. This guidance applies only after validation has been authorized
   large buffers rather than allocating one per frame.
 - Probe source metadata separately from output dimensions. Downscale high-resolution input
   before emitting raw frames.
+- Keep live and on-demand playback paths explicitly separated. Live streams must retain the
+  original live-edge worker lifecycle, automatic small-frame pipeline selection, and edge-based
+  PCM timing. Seek replacement workers, configured on-demand pipeline counts, and video-clock
+  audio rebasing must be guarded so they cannot overwrite live playback behavior.
 - Shared client/decoder state must consistently use synchronization, `volatile`, or atomic
   access according to the adapter's existing discipline.
 
